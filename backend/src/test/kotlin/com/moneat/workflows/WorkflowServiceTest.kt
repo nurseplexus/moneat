@@ -231,6 +231,11 @@ class WorkflowServiceTest {
             firstOrgWorkflows.mapNotNull { it.systemKey }.toSet()
         )
         assertEquals(3, firstOrgWorkflows.first { it.triggerName == "alert.triggered" }.steps.size)
+        val alertWorkflow = firstOrgWorkflows.first { it.systemKey == "default_alert_notifications" }
+        assertEquals(1, alertWorkflow.conditions.size)
+        assertEquals("alert.source", alertWorkflow.conditions.first().reference)
+        assertEquals("neq", alertWorkflow.conditions.first().operation)
+        assertEquals("ERROR_ALERT", alertWorkflow.conditions.first().value)
         assertFailsWith<IllegalArgumentException> {
             service.updateWorkflow(orgId, firstOrgWorkflows.first().id, UpdateWorkflowRequest(name = "Edited default"))
         }

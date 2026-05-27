@@ -193,17 +193,46 @@ dependencies {
     runtimeOnly(project(":ee"))
 }
 
+val emailsDir = file("${project.rootDir}/../emails")
+val builtEmailTemplatesDir = emailsDir.resolve("build/templates/email")
+
+val installEmailTemplateDependencies =
+    tasks.register<Exec>("installEmailTemplateDependencies") {
+        group = "build"
+        description = "Installs dependencies for building email templates"
+
+        workingDir = emailsDir
+        commandLine("npm", "ci")
+        onlyIf { emailsDir.resolve("package-lock.json").exists() && !emailsDir.resolve("node_modules").exists() }
+    }
+
+val buildEmailTemplates =
+    tasks.register<Exec>("buildEmailTemplates") {
+        group = "build"
+        description = "Builds production email templates for backend resources"
+
+        dependsOn(installEmailTemplateDependencies)
+        workingDir = emailsDir
+        commandLine("npm", "run", "build:production")
+        onlyIf { emailsDir.resolve("package.json").exists() }
+
+        inputs.files(fileTree(emailsDir.resolve("src")))
+        inputs.files(emailsDir.resolve("package.json"), emailsDir.resolve("package-lock.json"))
+        outputs.dir(builtEmailTemplatesDir)
+    }
+
 // Task to copy email templates into resources
 val copyEmailTemplates =
     tasks.register<Copy>("copyEmailTemplates") {
         group = "build"
         description = "Copies built email templates into backend resources"
 
-        from("${project.rootDir}/../emails/build/templates/email")
+        dependsOn(buildEmailTemplates)
+        from(builtEmailTemplatesDir)
         into(layout.buildDirectory.dir("resources/main/email-templates"))
 
         // Only copy if source exists
-        onlyIf { file("${project.rootDir}/../emails/build/templates/email").exists() }
+        onlyIf { builtEmailTemplatesDir.exists() }
     }
 
 // Task to copy email templates into test resources
@@ -212,11 +241,12 @@ val copyEmailTemplatesForTest =
         group = "build"
         description = "Copies built email templates into backend test resources"
 
-        from("${project.rootDir}/../emails/build/templates/email")
+        dependsOn(buildEmailTemplates)
+        from(builtEmailTemplatesDir)
         into(layout.buildDirectory.dir("resources/test/email-templates"))
 
         // Only copy if source exists
-        onlyIf { file("${project.rootDir}/../emails/build/templates/email").exists() }
+        onlyIf { builtEmailTemplatesDir.exists() }
     }
 
 // Ensure email templates are copied before processing resources

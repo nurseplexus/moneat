@@ -17,9 +17,10 @@
 package com.moneat.services
 
 import com.moneat.events.models.SentryEvent
-import com.moneat.alerts.models.AlertLifecycleEvent
+import com.moneat.notifications.services.DiscordService
 import com.moneat.notifications.services.EmailService
 import com.moneat.notifications.services.NotificationService
+import com.moneat.notifications.services.SlackService
 import com.moneat.shared.models.EmailsSent
 import com.moneat.shared.models.Memberships
 import com.moneat.shared.models.NotificationPreferences
@@ -27,7 +28,6 @@ import com.moneat.shared.models.Organizations
 import com.moneat.shared.models.Projects
 import com.moneat.shared.models.Users
 import com.moneat.testsupport.TestDatabaseHelper
-import com.moneat.workflows.services.WorkflowService
 import io.mockk.coVerify
 import io.mockk.mockk
 import kotlinx.coroutines.runBlocking
@@ -36,13 +36,16 @@ import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import kotlin.test.BeforeTest
 import kotlin.test.Test
-import kotlin.test.assertEquals
 import kotlin.time.Clock
 
 class NotificationServiceTest {
     companion object {
         private var db: org.jetbrains.exposed.v1.jdbc.Database? = null
     }
+
+    private val emailService = mockk<EmailService>(relaxed = true)
+    private val slackService = mockk<SlackService>(relaxed = true)
+    private val discordService = mockk<DiscordService>(relaxed = true)
 
     @BeforeTest
     fun setupDatabase() {
@@ -56,12 +59,11 @@ class NotificationServiceTest {
         }
         org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager.defaultDatabase = db
 
-        // Ensure schema exists (idempotent in H2) and clean between tests
         TestDatabaseHelper.resetSchema(Users, Organizations, Memberships, Projects, NotificationPreferences, EmailsSent)
     }
 
     @Test
-    fun `onNewIssue publishes workflow event for each issue`() =
+    fun `onNewIssue sends rich error alert email for each issue`() =
         runBlocking {
             val organizationId =
                 transaction {
@@ -111,8 +113,7 @@ class NotificationServiceTest {
                 }
             }
 
-            val workflowService = mockk<WorkflowService>(relaxed = true)
-            val notificationService = NotificationService(EmailService(), workflowService)
+            val notificationService = NotificationService(emailService, slackService, discordService)
             try {
                 val event =
                     SentryEvent(
@@ -122,16 +123,13 @@ class NotificationServiceTest {
                         message = "NullPointerException in checkout flow",
                         environment = "production"
                     )
-                val publishedEvents = mutableListOf<AlertLifecycleEvent>()
 
                 notificationService.onNewIssue(projectId, "1001", event)
                 notificationService.onNewIssue(projectId, "1002", event.copy(eventId = "evt-2"))
 
                 coVerify(exactly = 2) {
-                    workflowService.publishAlertTriggered(capture(publishedEvents))
+                    emailService.sendErrorAlertEmail("alerts@moneat.io", any())
                 }
-                assertEquals("moneat-error-1001", publishedEvents[0].deduplicationKey)
-                assertEquals("moneat-error-1002", publishedEvents[1].deduplicationKey)
             } finally {
                 notificationService.shutdown()
             }

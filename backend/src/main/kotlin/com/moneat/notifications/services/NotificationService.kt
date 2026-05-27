@@ -18,16 +18,11 @@ package com.moneat.notifications.services
 
 import com.moneat.config.ClickHouseClient
 import com.moneat.events.models.SentryEvent
-import com.moneat.alerts.models.AlertSource
-import com.moneat.alerts.models.AlertLifecycleEvent
-import com.moneat.alerts.models.AlertSeverity
-import com.moneat.alerts.models.AlertStatus
 import com.moneat.shared.models.Memberships
 import com.moneat.shared.models.NotificationPreferences
 import com.moneat.shared.models.Projects
 import com.moneat.shared.models.Users
 import com.moneat.utils.suspendRunCatching
-import com.moneat.workflows.services.WorkflowService
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.isSuccess
 import io.ktor.server.config.ApplicationConfig
@@ -76,7 +71,8 @@ private const val THOUSAND = 1_000L
 
 class NotificationService(
     private val emailService: EmailService,
-    private val workflowService: WorkflowService = WorkflowService(),
+    private val slackService: SlackService = SlackService(),
+    private val discordService: DiscordService = DiscordService(),
 ) {
     enum class WeeklySummaryResult { SENT, SKIPPED, FAILED }
     private val config = ApplicationConfig("application.conf")
@@ -224,19 +220,78 @@ class NotificationService(
                     unsubscribeUrl = "$settingsUrl?project=$projectId"
                 )
 
-            workflowService.publishAlertTriggered(
-                AlertLifecycleEvent(
-                    title = "New Issue: ${emailData.issueTitle}",
-                    description = "${emailData.projectName} reported ${emailData.issueLevel.uppercase()}: " +
-                        emailData.issueMessage,
-                    severity = severityForIssueLevel(emailData.issueLevel),
-                    status = AlertStatus.FIRING,
-                    source = AlertSource.ERROR_ALERT,
-                    deduplicationKey = "moneat-error-$issueId",
-                    organizationId = orgId,
-                    moneatUrl = issueUrl
-                )
-            )
+            usersToNotify.forEach { (email, _) ->
+                suspendRunCatching {
+                    emailService.sendErrorAlertEmail(email, emailData)
+                    logger.info { "Sent issue alert to $email for issue $issueId" }
+                }.getOrElse { e ->
+                    logger.error(e) { "Failed to send issue alert to $email" }
+                }
+            }
+
+            val prefsService = AlertNotificationPreferencesService()
+            val slackEnabled =
+                runCatching {
+                    prefsService
+                        .getUsersWithChannelEnabled(
+                            organizationId = orgId,
+                            alertSource = "ERROR_ALERT",
+                            channel = "slack"
+                        ).isNotEmpty()
+                }.getOrElse { e ->
+                    logger.warn(e) { "Unable to evaluate Slack alert preferences for org=$orgId" }
+                    false
+                }
+
+            if (slackEnabled) {
+                suspendRunCatching {
+                    slackService.sendErrorAlert(
+                        organizationId = orgId,
+                        projectName = projectName,
+                        issueTitle = emailData.issueTitle,
+                        level = emailData.issueLevel,
+                        culprit = culprit,
+                        issueId = issueId,
+                        baseUrl = frontendUrl,
+                        occurrenceCount = 1,
+                        environment = emailData.environment,
+                        timestamp = emailData.timestamp,
+                        stackTrace = stackTrace
+                    )
+                }.getOrElse { e ->
+                    logger.error(e) { "Failed to send Slack notification for new issue" }
+                }
+            }
+
+            val discordEnabled =
+                runCatching {
+                    prefsService
+                        .getUsersWithChannelEnabled(
+                            organizationId = orgId,
+                            alertSource = "ERROR_ALERT",
+                            channel = "discord"
+                        ).isNotEmpty()
+                }.getOrElse { e ->
+                    logger.warn(e) { "Unable to evaluate Discord alert preferences for org=$orgId" }
+                    false
+                }
+
+            if (discordEnabled) {
+                suspendRunCatching {
+                    discordService.sendErrorAlert(
+                        organizationId = orgId,
+                        projectName = projectName,
+                        issueTitle = emailData.issueTitle,
+                        level = emailData.issueLevel,
+                        firstSeen = emailData.timestamp,
+                        eventCount = 1,
+                        userCount = 0,
+                        issueUrl = issueUrl
+                    )
+                }.getOrElse { e ->
+                    logger.error(e) { "Failed to send Discord notification for new issue" }
+                }
+            }
         }.getOrElse { e ->
             logger.error(e) { "Error in onNewIssue handler" }
         }
@@ -701,15 +756,6 @@ class NotificationService(
     private fun formatDate(instant: Instant): String {
         val formatter = DateTimeFormatter.ofPattern("MMM dd, yyyy", Locale.US)
         return formatter.format(instant.atZone(ZoneId.of("UTC")))
-    }
-
-    private fun severityForIssueLevel(level: String): AlertSeverity {
-        return when (level.lowercase(Locale.getDefault())) {
-            "fatal" -> AlertSeverity.CRITICAL
-            "error" -> AlertSeverity.HIGH
-            "warning" -> AlertSeverity.MEDIUM
-            else -> AlertSeverity.LOW
-        }
     }
 
     fun shutdown() {

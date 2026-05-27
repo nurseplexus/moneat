@@ -21,20 +21,20 @@ import com.moneat.events.models.ExceptionValue
 import com.moneat.events.models.SentryEvent
 import com.moneat.events.models.StackFrame
 import com.moneat.events.models.StackTrace
-import com.moneat.alerts.models.AlertSource
-import com.moneat.alerts.models.AlertLifecycleEvent
-import com.moneat.alerts.models.AlertSeverity
-import com.moneat.alerts.models.AlertStatus
+import com.moneat.notifications.services.DiscordService
 import com.moneat.notifications.services.EmailService
 import com.moneat.notifications.services.NotificationService
+import com.moneat.notifications.services.SlackService
+import com.moneat.shared.models.AlertNotificationPreferences
+import com.moneat.shared.models.Memberships
+import com.moneat.shared.models.NotificationPreferences
 import com.moneat.shared.models.Organizations
 import com.moneat.shared.models.Projects
+import com.moneat.shared.models.Users
 import com.moneat.testsupport.TestDatabaseHelper
-import com.moneat.workflows.services.WorkflowService
 import io.mockk.coEvery
 import io.mockk.coVerify
 import io.mockk.mockk
-import io.mockk.slot
 import kotlinx.coroutines.runBlocking
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.insert
@@ -52,7 +52,8 @@ class NotificationServiceRoutingTest {
     }
 
     private val emailService = mockk<EmailService>(relaxed = true)
-    private val workflowService = mockk<WorkflowService>(relaxed = true)
+    private val slackService = mockk<SlackService>(relaxed = true)
+    private val discordService = mockk<DiscordService>(relaxed = true)
 
     @BeforeTest
     fun setupDatabase() {
@@ -67,8 +68,12 @@ class NotificationServiceRoutingTest {
         TransactionManager.defaultDatabase = db
 
         TestDatabaseHelper.resetSchema(
+            Users,
             Organizations,
+            Memberships,
             Projects,
+            NotificationPreferences,
+            AlertNotificationPreferences,
         )
     }
 
@@ -108,6 +113,48 @@ class NotificationServiceRoutingTest {
                 it[slug] = name.lowercase().replace(" ", "-")
             } get Projects.id
         }
+
+    private fun seedNotificationPrefs(
+        userId: Int,
+        issueAlerts: Boolean = true,
+        errorAlerts: Boolean = true,
+        frequencyMinutes: Int = 30
+    ) {
+        transaction {
+            NotificationPreferences.insert {
+                it[NotificationPreferences.user_id] = userId
+                it[NotificationPreferences.project_id] = null
+                it[issue_alerts] = issueAlerts
+                it[error_alerts] = errorAlerts
+                it[weekly_summary] = true
+                it[alert_frequency_minutes] = frequencyMinutes
+                it[created_at] = Clock.System.now()
+                it[updated_at] = Clock.System.now()
+            }
+        }
+    }
+
+    private fun seedAlertChannelPrefs(
+        userId: Int,
+        orgId: Int,
+        alertSource: String,
+        slackEnabled: Boolean = true,
+        discordEnabled: Boolean = true,
+        emailEnabled: Boolean = true
+    ) {
+        transaction {
+            AlertNotificationPreferences.insert {
+                it[AlertNotificationPreferences.user_id] = userId
+                it[organization_id] = orgId
+                it[alert_source] = alertSource
+                it[email_enabled] = emailEnabled
+                it[slack_enabled] = slackEnabled
+                it[discord_enabled] = discordEnabled
+                it[created_at] = Clock.System.now()
+                it[updated_at] = Clock.System.now()
+            }
+        }
+    }
 
     private fun buildEvent(
         eventId: String = "evt-1",
@@ -157,32 +204,26 @@ class NotificationServiceRoutingTest {
         )
 
     @Test
-    fun `onNewIssue publishes alert workflow event`() =
+    fun `onNewIssue sends rich error alert email`() =
         runBlocking {
-            val orgId = seedOrg("Workflow Route Org")
-            val projectId = seedProject(orgId, "WorkflowProject")
-            val eventSlot = slot<AlertLifecycleEvent>()
-            val service = NotificationService(emailService, workflowService)
+            val orgId = seedOrg("Email Route Org")
+            val userId = seedUser("route@moneat.io", "Route User")
+            seedMembership(userId, orgId)
+            val projectId = seedProject(orgId, "RouteProject")
+            seedNotificationPrefs(userId, frequencyMinutes = 0)
+
+            val service = NotificationService(emailService, slackService, discordService)
 
             try {
                 service.onNewIssue(projectId, "2001", buildEvent())
+                Thread.sleep(500)
 
                 coVerify(exactly = 1) {
-                    workflowService.publishAlertTriggered(capture(eventSlot))
+                    emailService.sendErrorAlertEmail("route@moneat.io", any())
                 }
             } finally {
                 service.shutdown()
             }
-
-            val event = eventSlot.captured
-            assertEquals("New Issue: Test error", event.title)
-            assertTrue(event.description.contains("WorkflowProject reported ERROR"))
-            assertEquals(AlertSeverity.HIGH, event.severity)
-            assertEquals(AlertStatus.FIRING, event.status)
-            assertEquals(AlertSource.ERROR_ALERT, event.source)
-            assertEquals("moneat-error-2001", event.deduplicationKey)
-            assertEquals("https://moneat.io/issues/2001", event.moneatUrl)
-            assertEquals(orgId, event.organizationId)
         }
 
     @Test
@@ -438,9 +479,9 @@ class NotificationServiceRoutingTest {
             // User with email_verified = false
             val userId = transaction {
                 Users.insert {
-                    it[email] = "unverified@moneat.io"
+                    it[Users.email] = "unverified@moneat.io"
                     it[password_hash] = "hash"
-                    it[name] = "Unverified"
+                    it[Users.name] = "Unverified"
                     it[email_verified] = false
                 } get Users.id
             }
@@ -464,59 +505,20 @@ class NotificationServiceRoutingTest {
     @Test
     fun `onNewIssue uses exception value when message is null`() =
         runBlocking {
-            val orgId = seedOrg("Exception Org")
+            val orgId = seedOrg("Exception Title Org")
+            val userId = seedUser("exc-title@moneat.io", "Exc Title User")
+            seedMembership(userId, orgId)
             val projectId = seedProject(orgId, "ExceptionProject")
-            val eventSlot = slot<AlertLifecycleEvent>()
-            val service = NotificationService(emailService, workflowService)
+            seedNotificationPrefs(userId, frequencyMinutes = 0)
+
+            val service = NotificationService(emailService, slackService, discordService)
 
             try {
                 service.onNewIssue(projectId, "4001", buildEventWithException())
+                Thread.sleep(500)
 
                 coVerify(exactly = 1) {
-                    workflowService.publishAlertTriggered(capture(eventSlot))
-                }
-            } finally {
-                service.shutdown()
-            }
-
-            val event = eventSlot.captured
-            assertEquals("New Issue: Cannot invoke method on null", event.title)
-            assertTrue(event.description.contains("ExceptionProject reported FATAL"))
-            assertEquals(AlertSeverity.CRITICAL, event.severity)
-            assertEquals(orgId, event.organizationId)
-        }
-
-    @Test
-    fun `onNewIssue returns early when project does not exist`() =
-        runBlocking {
-            val service = NotificationService(emailService, workflowService)
-
-            try {
-                service.onNewIssue(99999L, "5001", buildEvent())
-
-                coVerify(exactly = 0) {
-                    workflowService.publishAlertTriggered(any())
-                }
-            } finally {
-                service.shutdown()
-            }
-        }
-
-    @Test
-    fun `onNewIssue swallows workflow publication failure`() =
-        runBlocking {
-            val orgId = seedOrg("Failure Org")
-            val projectId = seedProject(orgId, "FailureProject")
-            coEvery {
-                workflowService.publishAlertTriggered(any())
-            } throws RuntimeException("workflow queue unavailable")
-            val service = NotificationService(emailService, workflowService)
-
-            try {
-                service.onNewIssue(projectId, "6001", buildEvent())
-
-                coVerify(exactly = 1) {
-                    workflowService.publishAlertTriggered(any())
+                    emailService.sendErrorAlertEmail("exc-title@moneat.io", any())
                 }
             } finally {
                 service.shutdown()

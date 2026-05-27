@@ -192,7 +192,7 @@ val eventsModule = module {
     }
 
     single { ReleaseService() }
-    single { NotificationService(get(), get()) }
+    single { NotificationService(get(), get(), get()) }
     single { EventService(get(), get(), get()) }
     single { DashboardService(get(), get(), get()) }
 }

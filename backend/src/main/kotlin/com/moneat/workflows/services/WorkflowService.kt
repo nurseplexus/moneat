@@ -131,7 +131,7 @@ class WorkflowService(
                 insertVersion(
                     workflowId = workflowId,
                     version = 1,
-                    conditions = emptyList(),
+                    conditions = definition.conditions,
                     steps = definition.steps,
                     onceForTemplate = definition.onceForTemplate,
                     now = now
@@ -870,6 +870,9 @@ class WorkflowService(
                     name = "Send alert notifications",
                     triggerName = ALERT_TRIGGERED_TRIGGER,
                     onceForTemplate = listOf(ALERT_DEDUPLICATION_KEY_REFERENCE),
+                    conditions = listOf(
+                        WorkflowConditionConfig(ALERT_SOURCE_REFERENCE, "neq", "ERROR_ALERT")
+                    ),
                     steps = listOf(
                         WorkflowStepConfig(
                             name = EMAIL_ORG_STEP,
@@ -955,7 +958,8 @@ private data class DefaultWorkflowDefinition(
     val name: String,
     val triggerName: String,
     val steps: List<WorkflowStepConfig>,
-    val onceForTemplate: List<String>
+    val onceForTemplate: List<String>,
+    val conditions: List<WorkflowConditionConfig> = emptyList()
 )
 
 private data class WorkflowVersionRecord(

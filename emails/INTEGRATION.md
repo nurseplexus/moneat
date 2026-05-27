@@ -13,6 +13,42 @@ npm run build:production
 
 This creates minified, CSS-inlined HTML in `emails/build/templates/email/`.
 
+## Moneat Build Behavior
+
+### Local Development
+
+When running the backend locally with Gradle, the backend build now builds and copies email templates automatically:
+
+```bash
+cd backend
+./gradlew run
+```
+
+`backend/build.gradle.kts` runs `npm run build:production` in `emails/` and copies the generated templates into:
+
+```text
+backend/build/resources/main/email-templates/
+```
+
+This is required for `EmailService` to load templates such as:
+
+```text
+email-templates/error-alert.html
+```
+
+If the template is missing from the backend runtime classpath, `EmailService` falls back to a short plain HTML email. That fallback is why local error alert emails can look much simpler than the full production template.
+
+### Production Docker Builds
+
+Production does not require a manual email-template build. `backend/Dockerfile` builds templates in the `email-builder` stage:
+
+```dockerfile
+RUN npm run build:production
+COPY --from=email-builder /emails/build/templates/email ./src/main/resources/email-templates/
+```
+
+So production Docker images already package the rich email templates into the backend JAR.
+
 ## Backend Integration Example
 
 ### 1. Copy Built Templates to Backend Resources
