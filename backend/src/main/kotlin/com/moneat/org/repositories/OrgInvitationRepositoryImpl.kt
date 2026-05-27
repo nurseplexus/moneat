@@ -24,6 +24,7 @@ import com.moneat.org.repositories.models.OrgInvitationUserRow
 import com.moneat.shared.models.OrgInvitations
 import com.moneat.shared.models.Organizations
 import com.moneat.shared.models.Users
+import org.jetbrains.exposed.v1.core.JoinType
 import org.jetbrains.exposed.v1.core.and
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.core.greater
@@ -119,7 +120,8 @@ class OrgInvitationRepositoryImpl : OrgInvitationRepository {
 
     override fun findPendingInvitations(orgId: Int, nowMs: Long): List<InvitationWithInviterRow> =
         transaction {
-            (OrgInvitations innerJoin Users)
+            OrgInvitations
+                .join(Users, JoinType.INNER, OrgInvitations.invited_by, Users.id)
                 .selectAll()
                 .where {
                     (OrgInvitations.organization_id eq orgId) and
@@ -141,7 +143,9 @@ class OrgInvitationRepositoryImpl : OrgInvitationRepository {
 
     override fun findInvitationDetails(token: String): OrgInvitationDetailsRow? =
         transaction {
-            (OrgInvitations innerJoin Organizations innerJoin Users)
+            OrgInvitations
+                .join(Organizations, JoinType.INNER, OrgInvitations.organization_id, Organizations.id)
+                .join(Users, JoinType.INNER, OrgInvitations.invited_by, Users.id)
                 .selectAll()
                 .where { OrgInvitations.token eq token }
                 .singleOrNull()
@@ -194,7 +198,9 @@ class OrgInvitationRepositoryImpl : OrgInvitationRepository {
 
     override fun findInviterAndOrgForResend(id: Int): InviterAndOrgRow? =
         transaction {
-            (OrgInvitations innerJoin Organizations innerJoin Users)
+            OrgInvitations
+                .join(Organizations, JoinType.INNER, OrgInvitations.organization_id, Organizations.id)
+                .join(Users, JoinType.INNER, OrgInvitations.invited_by, Users.id)
                 .selectAll()
                 .where { OrgInvitations.id eq id }
                 .singleOrNull()

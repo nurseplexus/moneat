@@ -33,6 +33,7 @@ import io.ktor.server.application.install
 import io.ktor.http.HttpStatusCode
 import io.ktor.server.metrics.micrometer.MicrometerMetrics
 import io.ktor.server.plugins.BadRequestException
+import io.ktor.server.plugins.NotFoundException
 import io.ktor.server.plugins.calllogging.CallLogging
 import io.ktor.server.plugins.statuspages.StatusPages
 import io.ktor.server.request.httpMethod
@@ -171,6 +172,14 @@ fun Application.configureMonitoring() {
                 call.respond(
                     HttpStatusCode.BadRequest,
                     ErrorResponse(cause.message ?: "Bad request"),
+                )
+            }
+        }
+        exception<NotFoundException> { call, cause ->
+            if (!call.response.isCommitted) {
+                call.respond(
+                    HttpStatusCode.NotFound,
+                    ErrorResponse(cause.message ?: "Not found"),
                 )
             }
         }
