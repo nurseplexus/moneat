@@ -52,10 +52,18 @@ import java.time.ZoneId
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 
 private val logger = KotlinLogging.logger {}
+
+private data class OrgNotifyUser(
+    val userId: Int,
+    val email: String,
+    val userName: String?,
+    val role: String,
+)
 
 private const val STACK_FRAMES_COUNT = 5
 private const val EPOCH_SECONDS_TO_MILLIS = 1000
@@ -75,6 +83,7 @@ class NotificationService(
     private val clickhouseDb: String get() = ClickHouseClient.getDatabase()
     private val frontendUrl = config.property("email.frontendUrl").getString()
     private val json = Json { ignoreUnknownKeys = true }
+    private val lastAlertTimes = ConcurrentHashMap<Pair<Int, Long>, Instant>()
 
     // Weekly summary scheduler
     private val scheduler = Executors.newScheduledThreadPool(1)
@@ -102,6 +111,61 @@ class NotificationService(
 
             val projectName = project[Projects.name]
             val orgId = project[Projects.organization_id]
+
+            // Notify verified org owners/admins always; members follow notification preferences.
+            val orgUsers =
+                transaction {
+                    Memberships
+                        .innerJoin(Users)
+                        .selectAll()
+                        .where {
+                            (Memberships.organization_id eq orgId) and
+                                (Users.email_verified eq true)
+                        }.map {
+                            OrgNotifyUser(
+                                userId = it[Users.id],
+                                email = it[Users.email],
+                                userName = it[Users.name],
+                                role = it[Memberships.role],
+                            )
+                        }
+                }
+            val usersToNotify =
+                orgUsers.mapNotNull { user ->
+                    val isOrgAdmin =
+                        user.role.equals("owner", ignoreCase = true) ||
+                            user.role.equals("admin", ignoreCase = true)
+                    val prefs = getPreferences(user.userId, projectId)
+                    if (!isOrgAdmin && (!prefs.issueAlerts || !prefs.errorAlerts)) {
+                        return@mapNotNull null
+                    }
+
+                    // Check rate limiting (org admins are not rate-limited for new issues)
+                    if (!isOrgAdmin) {
+                        val key = Pair(user.userId, projectId)
+                        val lastAlert = lastAlertTimes[key]
+                        val now = Instant.now()
+                        if (lastAlert != null) {
+                            val minutesSince = Duration.between(lastAlert, now).toMinutes()
+                            if (minutesSince < prefs.alertFrequencyMinutes) {
+                                logger.debug {
+                                    "Rate limiting alert for user=${user.userId} project=$projectId"
+                                }
+                                return@mapNotNull null
+                            }
+                        }
+                        lastAlertTimes[key] = now
+                    } else {
+                        lastAlertTimes[Pair(user.userId, projectId)] = Instant.now()
+                    }
+
+                    Pair(user.email, user.userName)
+                }
+
+            if (usersToNotify.isEmpty()) {
+                logger.debug { "No users to notify for issue $issueId" }
+                return
+            }
 
             // Build email data
             val issueUrl = "$frontendUrl/issues/$issueId"

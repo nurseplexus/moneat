@@ -44,8 +44,11 @@ import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.msgpack.core.MessagePack
 import org.msgpack.core.MessageUnpacker
 import org.msgpack.value.ValueType
+import java.io.ByteArrayInputStream
 import java.time.Instant
 import java.util.Base64
+import java.util.zip.GZIPInputStream
+import java.util.zip.InflaterInputStream
 import com.moneat.utils.HttpConstants.HTTP_SUCCESS_RANGE
 
 private val logger = KotlinLogging.logger {}
@@ -314,6 +317,108 @@ class ReplayService(
         }
     }
 
+    private fun indexFirstNonWhitespaceByte(rawBytes: ByteArray): Int {
+        for (i in rawBytes.indices) {
+            when (rawBytes[i].toInt() and 0xFF) {
+                ' '.code, '\n'.code, '\r'.code, '\t'.code -> continue
+                else -> return i
+            }
+        }
+        return -1
+    }
+
+    /**
+     * True only if the entire UTF-8 payload is a single JSON value (no trailing bytes).
+     * Sentry web replays often send `{"segment_id":N}` + zlib; those must not use this path.
+     */
+    private fun isStrictFullJsonPayload(rawBytes: ByteArray): Boolean {
+        val text = String(rawBytes, Charsets.UTF_8)
+        return runCatching {
+            json.parseToJsonElement(text)
+            true
+        }.getOrDefault(false)
+    }
+
+    private fun skipAsciiWhitespaceFrom(
+        start: Int,
+        rawBytes: ByteArray
+    ): Int {
+        var i = start
+        while (i < rawBytes.size) {
+            when (rawBytes[i].toInt() and 0xFF) {
+                ' '.code, '\n'.code, '\r'.code, '\t'.code -> i++
+                else -> return i
+            }
+        }
+        return i
+    }
+
+    /**
+     * Returns the index *after* the closing `}` of the first top-level JSON object, or -1.
+     * Handles quoted strings so braces inside strings are ignored.
+     */
+    private fun findEndOfLeadingJsonObject(rawBytes: ByteArray): Int {
+        val start = indexFirstNonWhitespaceByte(rawBytes)
+        if (start == -1 || rawBytes[start] != '{'.code.toByte()) return -1
+        var i = start
+        var depth = 0
+        var inString = false
+        var escape = false
+        while (i < rawBytes.size) {
+            val b = rawBytes[i].toInt() and 0xFF
+            when {
+                escape -> escape = false
+                inString ->
+                    when (b) {
+                        '\\'.code -> escape = true
+                        '"'.code -> inString = false
+                    }
+
+                b == '"'.code -> inString = true
+                b == '{'.code -> depth++
+                b == '}'.code -> {
+                    depth--
+                    if (depth == 0) return i + 1
+                }
+            }
+            i++
+        }
+        return -1
+    }
+
+    private fun tryZlibInflate(compressed: ByteArray): ByteArray? =
+        runCatching {
+            InflaterInputStream(ByteArrayInputStream(compressed)).use { it.readBytes() }
+        }.getOrNull()
+
+    private fun tryGzipInflate(compressed: ByteArray): ByteArray? =
+        runCatching {
+            GZIPInputStream(ByteArrayInputStream(compressed)).use { it.readBytes() }
+        }.getOrNull()
+
+    /**
+     * Decompress (zlib/gzip) if applicable, then parse rrweb JSON events from the tail.
+     */
+    private fun decodeReplayRecordingTail(
+        tail: ByteArray,
+        segmentIdx: Int
+    ): List<JsonElement> {
+        if (tail.isEmpty()) return emptyList()
+        val zlibOut = tryZlibInflate(tail)
+        val gzipOut = if (zlibOut == null) tryGzipInflate(tail) else null
+        val inflated = zlibOut ?: gzipOut
+        val candidate = inflated ?: tail
+        val asString =
+            runCatching { String(candidate, Charsets.UTF_8) }.getOrNull()
+                ?: return emptyList()
+        val fromJson = parseJsonEvents(asString.trim(), segmentIdx)
+        if (fromJson.isNotEmpty()) return fromJson
+        if (inflated == null) {
+            return decodeMsgpackReplaySegment(tail, segmentIdx).events
+        }
+        return emptyList()
+    }
+
     private fun parseReplayRecordingBinary(
         payloadBytes: ByteArray,
         segmentIdx: Int
@@ -360,19 +465,33 @@ class ReplayService(
         val rawBytes = runCatching { Base64.getDecoder().decode(recordingData) }.getOrNull()
             ?: return SegmentDecodeResult(events = parseJsonEvents(recordingData, segmentIdx))
 
-        if (isJsonPayload(rawBytes)) {
+        val firstIdx = indexFirstNonWhitespaceByte(rawBytes)
+        if (firstIdx >= 0 && rawBytes[firstIdx] == '['.code.toByte()) {
             return SegmentDecodeResult(events = parseJsonEvents(String(rawBytes, Charsets.UTF_8), segmentIdx))
         }
 
-        return decodeMsgpackReplaySegment(rawBytes, segmentIdx)
-    }
-
-    private fun isJsonPayload(rawBytes: ByteArray): Boolean {
-        val firstNonWhitespace = rawBytes.firstOrNull {
-            val code = it.toInt()
-            code != ' '.code && code != '\n'.code && code != '\r'.code && code != '\t'.code
+        if (isStrictFullJsonPayload(rawBytes)) {
+            return SegmentDecodeResult(events = parseJsonEvents(String(rawBytes, Charsets.UTF_8), segmentIdx))
         }
-        return firstNonWhitespace == '['.code.toByte() || firstNonWhitespace == '{'.code.toByte()
+
+        val jsonEnd = findEndOfLeadingJsonObject(rawBytes)
+        if (jsonEnd > 0 && jsonEnd < rawBytes.size) {
+            val headerBytes = rawBytes.copyOfRange(0, jsonEnd)
+            val bodyStart = skipAsciiWhitespaceFrom(jsonEnd, rawBytes)
+            if (bodyStart < rawBytes.size) {
+                val tail = rawBytes.copyOfRange(bodyStart, rawBytes.size)
+                val segmentId = extractSegmentIdFromJsonPayload(String(headerBytes, Charsets.UTF_8))
+                val tailEvents = decodeReplayRecordingTail(tail, segmentIdx)
+                if (tailEvents.isNotEmpty()) {
+                    return SegmentDecodeResult(
+                        events = annotateEventsWithSegmentId(tailEvents, segmentId ?: segmentIdx),
+                        isMobileReplay = false
+                    )
+                }
+            }
+        }
+
+        return decodeMsgpackReplaySegment(rawBytes, segmentIdx)
     }
 
     private fun decodeMsgpackReplaySegment(rawBytes: ByteArray, segmentIdx: Int): SegmentDecodeResult {

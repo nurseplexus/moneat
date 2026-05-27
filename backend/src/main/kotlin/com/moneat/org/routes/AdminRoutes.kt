@@ -556,7 +556,7 @@ fun Route.adminRoutes() {
                                                 issueTitle = "NullPointerException in UserService",
                                                 level = "error",
                                                 culprit = "com.example.UserService.getUser",
-                                                issueId = "12345",
+                                                issueId = "12345abcdef67890",
                                                 baseUrl = frontendUrl,
                                                 occurrenceCount = 42,
                                                 environment = "production",

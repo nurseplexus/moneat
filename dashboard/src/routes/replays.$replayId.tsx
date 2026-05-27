@@ -67,6 +67,96 @@ function formatDate(isoString: string, timezone: string) {
   return formatDateTimeUtil(date, timezone)
 }
 
+/** Hard cap for UI + scrubber so bad timestamps / metadata cannot blow up the timeline. */
+const MAX_REPLAY_DISPLAY_MS = 48 * 60 * 60 * 1000
+
+/** Sentry / rrweb core event types are small integers; skip string-typed wrapper events (e.g. mobile_replay_video). */
+function isRrwebNumericEvent(e: unknown): boolean {
+  if (!e || typeof e !== 'object' || !('type' in e)) return false
+  const t = (e as { type: unknown }).type
+  return typeof t === 'number' && Number.isFinite(t) && t >= 0 && t < 1000
+}
+
+function collectRrwebCoreTimestamps(events: unknown[]): number[] {
+  const out: number[] = []
+  for (const e of events) {
+    if (!isRrwebNumericEvent(e)) continue
+    const ts = (e as { timestamp?: unknown }).timestamp
+    if (typeof ts === 'number' && Number.isFinite(ts)) out.push(ts)
+  }
+  return out
+}
+
+/**
+ * When SDKs mix relative offsets with epoch ms, naive max-min spans years.
+ * Among all windows with sorted[j] - sorted[i] <= MAX, pick the one with the largest span, breaking ties by
+ * event count. That ignores huge piles of duplicate timestamps (e.g. stray `0`) in favour of the real progression.
+ */
+function robustTimestampBounds(timestamps: number[]): { min: number; max: number; span: number } {
+  if (timestamps.length === 0) return { min: 0, max: 0, span: 0 }
+  if (timestamps.length === 1) {
+    const only = timestamps[0]!
+    return { min: only, max: only, span: 0 }
+  }
+  const sorted = [...timestamps].sort((a, b) => a - b)
+  const n = sorted.length
+  const min0 = sorted[0]!
+  const max0 = sorted[n - 1]!
+  const span0 = max0 - min0
+  if (span0 <= MAX_REPLAY_DISPLAY_MS) {
+    return { min: min0, max: max0, span: span0 }
+  }
+
+  let bestI = 0
+  let bestJ = 0
+  let bestSpan = -1
+  let bestWidth = 0
+  let i = 0
+  for (let j = 0; j < n; j++) {
+    while (sorted[j]! - sorted[i]! > MAX_REPLAY_DISPLAY_MS && i < j) {
+      i++
+    }
+    const span = sorted[j]! - sorted[i]!
+    const width = j - i + 1
+    if (span > bestSpan || (span === bestSpan && width > bestWidth)) {
+      bestSpan = span
+      bestWidth = width
+      bestI = i
+      bestJ = j
+    }
+  }
+
+  const winMin = sorted[bestI]!
+  const winMax = sorted[bestJ]!
+  return { min: winMin, max: winMax, span: winMax - winMin }
+}
+
+/** Shift rrweb timestamps to start at 0 and sort — fixes mixed epoch/relative payloads that otherwise white-screen. */
+function prepareWebReplayPlaybackEvents(events: unknown[]): unknown[] {
+  if (!Array.isArray(events) || events.length === 0) return events
+  const tsList = collectRrwebCoreTimestamps(events)
+  const { min: winMin, max: winMax } = robustTimestampBounds(tsList)
+  if (!Number.isFinite(winMin) || !Number.isFinite(winMax)) return events
+
+  const adjusted = events.map((e) => {
+    if (!isRrwebNumericEvent(e)) return e
+    const rec = e as Record<string, unknown>
+    const ts = rec.timestamp
+    if (typeof ts !== 'number' || !Number.isFinite(ts)) return e
+    const clamped = Math.min(Math.max(ts, winMin), winMax)
+    return { ...rec, timestamp: clamped - winMin }
+  })
+
+  return [...adjusted].sort((a, b) => {
+    const getTs = (x: unknown): number => {
+      if (!x || typeof x !== 'object' || !('timestamp' in x)) return 0
+      const t = (x as { timestamp: unknown }).timestamp
+      return typeof t === 'number' && Number.isFinite(t) ? t : 0
+    }
+    return getTs(a) - getTs(b)
+  })
+}
+
 /** Compute actual recording duration from events. Backend replay.durationMs uses session span and can be wrong. */
 function getRecordingDurationMs(events: unknown[], isMobileReplay: boolean): number {
   if (!Array.isArray(events) || events.length === 0) return 0
@@ -111,28 +201,15 @@ function getRecordingDurationMs(events: unknown[], isMobileReplay: boolean): num
     return total
   }
 
-  // rrweb: duration = max(timestamp) - min(timestamp)
-  let minTs = Infinity
-  let maxTs = -Infinity
-  for (const e of events) {
-    if (e && typeof e === 'object' && 'timestamp' in e && typeof (e as { timestamp: unknown }).timestamp === 'number') {
-      const ts = (e as { timestamp: number }).timestamp
-      minTs = Math.min(minTs, ts)
-      maxTs = Math.max(maxTs, ts)
-    }
-  }
-  return minTs < maxTs ? maxTs - minTs : 0
+  // rrweb: use only core event timestamps; robust bounds avoid epoch/relative mixing blowing up duration.
+  const tsList = collectRrwebCoreTimestamps(events)
+  return robustTimestampBounds(tsList).span
 }
 
 function getRecordingStartMs(events: unknown[]): number | null {
-  let minTs = Infinity
-  for (const e of events) {
-    if (e && typeof e === 'object' && 'timestamp' in e && typeof (e as { timestamp: unknown }).timestamp === 'number') {
-      const ts = (e as { timestamp: number }).timestamp
-      minTs = Math.min(minTs, ts)
-    }
-  }
-  return Number.isFinite(minTs) ? minTs : null
+  const tsList = collectRrwebCoreTimestamps(events)
+  const { min } = robustTimestampBounds(tsList)
+  return Number.isFinite(min) ? min : null
 }
 
 function isLikelyEpochMs(timestampMs: number | null): boolean {
@@ -326,6 +403,7 @@ function ReplayDetailPage() {
   const mobileReplayViewerRef = useRef<MobileReplayViewerHandle>(null)
 
   const events = useMemo(() => recording?.events ?? [], [recording?.events])
+
   const hasMobileVideoSegments = events.some((event) => {
     if (typeof event !== 'object' || event === null || !('type' in event)) return false
     return (event as { type: unknown }).type === 'mobile_replay_video'
@@ -340,17 +418,44 @@ function ReplayDetailPage() {
       'type' in events[0] &&
       (events[0] as { type: unknown }).type === 'mobile_replay_not_supported')
 
+  /** Web rrweb: normalize timestamps + order so rrweb-player can render (avoids white screen on mixed clocks). */
+  const playbackEvents = useMemo(
+    () => (isMobileReplay ? events : prepareWebReplayPlaybackEvents(events)),
+    [events, isMobileReplay],
+  )
+
   // Prefer player-reported duration (onDurationReady); fallback to computed or backend
   const computedDurationMs = useMemo(
-    () => getRecordingDurationMs(events, isMobileReplay),
-    [events, isMobileReplay]
+    () => getRecordingDurationMs(isMobileReplay ? events : playbackEvents, isMobileReplay),
+    [events, playbackEvents, isMobileReplay]
   )
   const recordingStartMs = useMemo(
-    () => getRecordingStartMs(events),
-    [events]
+    () => getRecordingStartMs(isMobileReplay ? events : playbackEvents),
+    [events, playbackEvents, isMobileReplay]
   )
-  const durationMs =
-    recordingDurationMs > 0 ? recordingDurationMs : computedDurationMs > 0 ? computedDurationMs : (replay?.durationMs ?? 0)
+  const playerReportedMs =
+    recordingDurationMs > 0 &&
+    Number.isFinite(recordingDurationMs) &&
+    recordingDurationMs <= MAX_REPLAY_DISPLAY_MS
+      ? recordingDurationMs
+      : 0
+  const backendDurationMs = replay?.durationMs ?? 0
+  const backendDurationSanitized =
+    Number.isFinite(backendDurationMs) &&
+    backendDurationMs > 0 &&
+    backendDurationMs <= MAX_REPLAY_DISPLAY_MS
+      ? backendDurationMs
+      : 0
+  const durationMsRaw =
+    playerReportedMs > 0
+      ? playerReportedMs
+      : computedDurationMs > 0
+        ? computedDurationMs
+        : backendDurationSanitized
+  const durationMs = Math.min(
+    Number.isFinite(durationMsRaw) ? durationMsRaw : 0,
+    MAX_REPLAY_DISPLAY_MS,
+  )
   const mobileCompressedTimeMapper = useMemo(
     () => (isMobileReplay ? createMobileCompressedTimeMapper(events) : null),
     [events, isMobileReplay]
@@ -640,7 +745,7 @@ function ReplayDetailPage() {
             >
               <ReplayPlayer
                 ref={replayPlayerRef}
-                events={events}
+                events={playbackEvents}
                 width={800}
                 height={450}
                 autoPlay={false}

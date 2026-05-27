@@ -28,6 +28,10 @@ import io.mockk.coEvery
 import io.mockk.mockk
 import kotlinx.coroutines.runBlocking
 import org.jetbrains.exposed.v1.jdbc.Database
+import java.io.ByteArrayOutputStream
+import java.util.Base64
+import java.util.zip.Deflater
+import java.util.zip.DeflaterOutputStream
 import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -202,6 +206,39 @@ class ReplayServiceTest {
             val spanItem = result.items.find { it.type == "span" }
             assertNotNull(spanItem)
             assertEquals("SELECT *", spanItem.title)
+        }
+    }
+
+    @Test
+    fun `getReplayRecording decodes zlib tail after json segment header`() = runBlocking {
+        val replayId = REPLAY_UUID
+        val header = """{"segment_id":5}"""
+        val eventsJson = """[{"type":4,"data":{"href":"https://example.com/page"}}]"""
+        val compressed =
+            ByteArrayOutputStream().use { baos ->
+                DeflaterOutputStream(baos, Deflater(Deflater.DEFAULT_COMPRESSION, false)).use { dos ->
+                    dos.write(eventsJson.toByteArray(Charsets.UTF_8))
+                }
+                baos.toByteArray()
+            }
+        val combined = header.toByteArray(Charsets.UTF_8) + compressed
+        val recordingB64 = Base64.getEncoder().encodeToString(combined)
+        val segmentRow = """{"recording_data":"$recordingB64"}"""
+
+        withClickHouseMockServer({ exchange ->
+            val query = exchange.requestBodyText()
+            when {
+                query.contains("replay_events") && query.contains("replay_id") && !query.contains("GROUP BY") ->
+                    exchange.respond(200, """{"project_id":1}""", TEXT_PLAIN)
+                query.contains("replay_segments") ->
+                    exchange.respond(200, segmentRow, TEXT_PLAIN)
+                else ->
+                    exchange.respond(200, "", TEXT_PLAIN)
+            }
+        }) {
+            val result = service.getReplayRecording(replayId)
+            assertNotNull(result)
+            assertTrue(result.events.isNotEmpty(), "expected rrweb events after zlib decode")
         }
     }
 }

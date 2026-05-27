@@ -156,7 +156,11 @@ const rrwebPlayerRef = forwardRef<ReplayPlayerHandle, ReplayPlayerProps>(functio
           const startTime = meta?.startTime ?? 0
           const endTime = meta?.endTime ?? 0
           if (typeof startTime === 'number' && typeof endTime === 'number' && endTime > startTime) {
-            onDurationReadyRef.current?.(endTime - startTime)
+            const span = endTime - startTime
+            const MAX = 48 * 60 * 60 * 1000
+            if (span <= MAX) {
+              onDurationReadyRef.current?.(span)
+            }
           }
         } catch {
           // ignore

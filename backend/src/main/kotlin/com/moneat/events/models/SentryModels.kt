@@ -16,6 +16,7 @@
 
 package com.moneat.events.models
 
+import kotlinx.serialization.ExperimentalSerializationApi
 import kotlinx.serialization.KSerializer
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
@@ -387,6 +388,33 @@ object FlexibleTimestampSerializer : KSerializer<Double?> {
     }
 }
 
+/**
+ * Accepts JSON strings and primitives (e.g. numeric user ids) for fields modeled as [String] in Kotlin.
+ */
+@OptIn(ExperimentalSerializationApi::class)
+object FlexibleStringSerializer : KSerializer<String?> {
+    override val descriptor: SerialDescriptor =
+        PrimitiveSerialDescriptor("FlexibleString", PrimitiveKind.STRING)
+
+    override fun deserialize(decoder: Decoder): String? {
+        val jsonDecoder = decoder as? JsonDecoder
+            ?: return runCatching { decoder.decodeString() }.getOrNull()
+        return when (val element = jsonDecoder.decodeJsonElement()) {
+            JsonNull -> null
+            is JsonPrimitive -> element.contentOrNull ?: element.toString()
+            else -> element.toString()
+        }
+    }
+
+    override fun serialize(encoder: Encoder, value: String?) {
+        if (value == null) {
+            encoder.encodeNull()
+        } else {
+            encoder.encodeString(value)
+        }
+    }
+}
+
 @Serializable
 data class SentryTransaction(
     @SerialName("event_id") val eventId: String? = null,
@@ -469,6 +497,7 @@ data class StackFrame(
 
 @Serializable
 data class UserInfo(
+    @Serializable(with = FlexibleStringSerializer::class)
     val id: String? = null,
     val email: String? = null,
     val username: String? = null,

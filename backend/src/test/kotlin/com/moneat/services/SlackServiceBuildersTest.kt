@@ -179,7 +179,7 @@ class SlackServiceBuildersTest {
                     issueTitle = "NullPointerException",
                     level = "error",
                     culprit = "com.moneat.Main",
-                    issueId = "a1b2c3d4e5f6abc0",
+                    issueId = "a1b2c3d4e5f67890",
                     baseUrl = BASE_URL
                 )
             )
@@ -377,7 +377,7 @@ class SlackServiceBuildersTest {
                 issueTitle = "NullPointerException in UserService",
                 level = "error",
                 culprit = "com.moneat.services.UserService.getUser",
-                issueId = "500",
+                issueId = "a1b2c3d4e5f67890",
                 baseUrl = BASE_URL,
                 occurrenceCount = 15,
                 environment = "production",
@@ -398,7 +398,7 @@ class SlackServiceBuildersTest {
                 issueTitle = "Deprecated API usage",
                 level = "warning",
                 culprit = null,
-                issueId = "501",
+                issueId = "b2c3d4e5f6789012",
                 baseUrl = BASE_URL
             )
             assertFalse(result)
@@ -415,7 +415,7 @@ class SlackServiceBuildersTest {
                 issueTitle = "Feature flag evaluated",
                 level = "info",
                 culprit = "flags.ts:evaluate",
-                issueId = "502",
+                issueId = "c3d4e5f678901234",
                 baseUrl = BASE_URL,
                 environment = "staging"
             )
@@ -433,7 +433,7 @@ class SlackServiceBuildersTest {
                 issueTitle = "Unrecognized event type",
                 level = "debug",
                 culprit = null,
-                issueId = "503",
+                issueId = "d4e5f67890123456",
                 baseUrl = BASE_URL,
                 occurrenceCount = 1,
                 timestamp = "2024-06-15T12:00:00Z"
@@ -452,7 +452,7 @@ class SlackServiceBuildersTest {
                 issueTitle = "TimeoutException",
                 level = "error",
                 culprit = null,
-                issueId = "504",
+                issueId = "e5f6789012345678",
                 baseUrl = BASE_URL
             )
             assertFalse(result)
@@ -541,7 +541,7 @@ class SlackServiceBuildersTest {
                     issueTitle = "Error",
                     level = "error",
                     culprit = null,
-                    issueId = "1",
+                    issueId = "f678901234567890",
                     baseUrl = BASE_URL
                 )
             )
