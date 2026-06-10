@@ -24,7 +24,6 @@ import com.moneat.events.models.ProjectResponse
 import com.moneat.events.models.UpdateProjectRequest
 import com.moneat.events.repositories.ProjectRepository
 import java.security.SecureRandom
-import java.util.Base64
 
 class ProjectService(
     private val projectRepository: ProjectRepository,
@@ -34,8 +33,8 @@ class ProjectService(
 ) {
 
     companion object {
-        private const val KEY_BYTE_LENGTH = 32
-        private const val PUBLIC_KEY_LENGTH = 40
+        /** 16 random bytes → 32 lowercase hex chars, matching Sentry's `secrets.token_hex(16)`. */
+        private const val API_KEY_BYTE_LENGTH = 16
     }
 
     suspend fun getProjects(
@@ -158,15 +157,13 @@ class ProjectService(
             .ifBlank { "project" }
     }
 
-    private fun generatePublicKey(): String {
-        val bytes = ByteArray(KEY_BYTE_LENGTH)
-        SecureRandom().nextBytes(bytes)
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes).take(PUBLIC_KEY_LENGTH)
-    }
+    private fun generatePublicKey(): String = generateApiKeyHex()
 
-    private fun generateSecretKey(): String {
-        val bytes = ByteArray(KEY_BYTE_LENGTH)
+    private fun generateSecretKey(): String = generateApiKeyHex()
+
+    private fun generateApiKeyHex(): String {
+        val bytes = ByteArray(API_KEY_BYTE_LENGTH)
         SecureRandom().nextBytes(bytes)
-        return Base64.getUrlEncoder().withoutPadding().encodeToString(bytes)
+        return bytes.joinToString("") { byte -> "%02x".format(byte) }
     }
 }
