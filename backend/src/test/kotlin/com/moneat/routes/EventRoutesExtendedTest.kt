@@ -636,9 +636,9 @@ class EventRoutesExtendedTest {
     @Test
     fun `GET replay recording returns 200`() = testApplication {
         val (userId, _) = seedUserWithProject()
-        coEvery { mockDashboardService.hasReplayAccess(userId, "replay-rec") } returns true
+        coEvery { mockDashboardService.getReplayAccessProjectId(userId, "replay-rec") } returns 1L
         coEvery {
-            mockDashboardService.getReplayRecording("replay-rec")
+            mockDashboardService.getReplayRecording("replay-rec", 1L)
         } returns ReplayRecordingResponse(events = emptyList<JsonElement>())
 
         application { installTestApp() }
@@ -651,8 +651,8 @@ class EventRoutesExtendedTest {
     @Test
     fun `GET replay recording returns 404 when not found`() = testApplication {
         val (userId, _) = seedUserWithProject()
-        coEvery { mockDashboardService.hasReplayAccess(userId, "replay-rec-m") } returns true
-        coEvery { mockDashboardService.getReplayRecording("replay-rec-m") } returns null
+        coEvery { mockDashboardService.getReplayAccessProjectId(userId, "replay-rec-m") } returns 1L
+        coEvery { mockDashboardService.getReplayRecording("replay-rec-m", 1L) } returns null
 
         application { installTestApp() }
         val response = client.get("/v1/replays/replay-rec-m/recording") {

@@ -27,6 +27,10 @@ import com.moneat.utils.ClickHouseQueryUtils
 import com.moneat.utils.ClickHouseSqlUtils.escapeSql
 import com.moneat.utils.suspendRunCatching
 import io.ktor.client.statement.bodyAsText
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
@@ -319,7 +323,7 @@ class ReplayService(
 
     private fun indexFirstNonWhitespaceByte(rawBytes: ByteArray): Int {
         for (i in rawBytes.indices) {
-            when (rawBytes[i].toInt() and 0xFF) {
+            when (rawBytes[i].toInt() and UNSIGNED_BYTE_MASK) {
                 ' '.code, '\n'.code, '\r'.code, '\t'.code -> continue
                 else -> return i
             }
@@ -328,14 +332,17 @@ class ReplayService(
     }
 
     /**
-     * True only if the entire UTF-8 payload is a single JSON value (no trailing bytes).
+     * True only if the entire UTF-8 payload is a JSON array or object (no trailing bytes).
      * Sentry web replays often send `{"segment_id":N}` + zlib; those must not use this path.
+     * Primitive JSON values (e.g. a lone string) are rejected so binary/msgpack tails are not misread.
      */
     private fun isStrictFullJsonPayload(rawBytes: ByteArray): Boolean {
         val text = String(rawBytes, Charsets.UTF_8)
         return runCatching {
-            json.parseToJsonElement(text)
-            true
+            when (json.parseToJsonElement(text)) {
+                is JsonArray, is JsonObject -> true
+                else -> false
+            }
         }.getOrDefault(false)
     }
 
@@ -345,7 +352,7 @@ class ReplayService(
     ): Int {
         var i = start
         while (i < rawBytes.size) {
-            when (rawBytes[i].toInt() and 0xFF) {
+            when (rawBytes[i].toInt() and UNSIGNED_BYTE_MASK) {
                 ' '.code, '\n'.code, '\r'.code, '\t'.code -> i++
                 else -> return i
             }
@@ -365,7 +372,7 @@ class ReplayService(
         var inString = false
         var escape = false
         while (i < rawBytes.size) {
-            val b = rawBytes[i].toInt() and 0xFF
+            val b = rawBytes[i].toInt() and UNSIGNED_BYTE_MASK
             when {
                 escape -> escape = false
                 inString ->
@@ -456,6 +463,13 @@ class ReplayService(
         if (payloadBytes.size < MP4_HEADER_MIN_BYTES) return false
         val boxType = String(payloadBytes.copyOfRange(MP4_BOX_TYPE_OFFSET, MP4_HEADER_MIN_BYTES), Charsets.US_ASCII)
         return boxType == "ftyp"
+    }
+
+    private fun decodeRecordingLine(line: String, segmentIdx: Int): SegmentDecodeResult {
+        val obj = json.parseToJsonElement(line).jsonObject
+        val recordingData = obj["recording_data"]?.jsonPrimitive?.content
+            ?: return SegmentDecodeResult(events = emptyList())
+        return decodeReplaySegment(recordingData, segmentIdx)
     }
 
     private fun decodeReplaySegment(
@@ -1053,9 +1067,12 @@ class ReplayService(
         return ReplayTimelineResponse(items = sorted, replayStartMs = replayStartMs)
     }
 
-    suspend fun getReplayRecording(replayId: String): ReplayRecordingResponse? {
+    suspend fun getReplayRecording(
+        replayId: String,
+        knownProjectId: Long? = null,
+    ): ReplayRecordingResponse? {
         val normalizedReplayId = queryHelper.normalizeUuid(replayId) ?: return null
-        val projectId = getProjectIdForReplay(normalizedReplayId) ?: return null
+        val projectId = knownProjectId ?: getProjectIdForReplay(normalizedReplayId) ?: return null
         val retentionDays = queryHelper.getProjectRetentionDays(projectId)
         val projectIdClause = ClickHouseQueryUtils.projectIdClause(projectId)
 
@@ -1063,7 +1080,7 @@ class ReplayService(
             """
             SELECT recording_data
             FROM `$clickhouseDb`.replay_segments
-            WHERE toString(replay_id) = '$normalizedReplayId'
+            WHERE replay_id = '$normalizedReplayId'
                 AND $projectIdClause
                 AND timestamp >= now64(3) - INTERVAL $retentionDays DAY
             ORDER BY segment_id ASC
@@ -1074,24 +1091,25 @@ class ReplayService(
             val response = ClickHouseClient.execute(query)
             val body = queryHelper.extractClickHouseBody(response) ?: return null
 
+            val segmentLines = body.lines().filter { it.isNotBlank() }
+            logger.debug { "Processing replay recording response, body lines: ${segmentLines.size}" }
+
+            val decodedSegments =
+                withContext(Dispatchers.Default) {
+                    segmentLines
+                        .mapIndexed { segmentIdx, line ->
+                            async { decodeRecordingLine(line, segmentIdx) }
+                        }.awaitAll()
+                }
+
             val allEvents = mutableListOf<JsonElement>()
             var isMobileReplay = false
-
-            val bodyLineCount = body.lines().count { it.isNotBlank() }
-            logger.debug { "Processing replay recording response, body lines: $bodyLineCount" }
-
-            body
-                .lines()
-                .filter { it.isNotBlank() }
-                .forEachIndexed { segmentIdx, line ->
-                    val obj = json.parseToJsonElement(line).jsonObject
-                    val recordingData = obj["recording_data"]?.jsonPrimitive?.content ?: return@forEachIndexed
-                    val segment = decodeReplaySegment(recordingData, segmentIdx)
-                    if (segment.isMobileReplay) {
-                        isMobileReplay = true
-                    }
-                    allEvents.addAll(segment.events)
+            decodedSegments.forEach { segment ->
+                if (segment.isMobileReplay) {
+                    isMobileReplay = true
                 }
+                allEvents.addAll(segment.events)
+            }
 
             logger.info { "Msgpack decoding complete, extracted ${allEvents.size} total events from all segments" }
 
@@ -1185,6 +1203,7 @@ class ReplayService(
     }
 
     companion object {
+        private const val UNSIGNED_BYTE_MASK = 0xFF
         private const val LOG_BODY_PREVIEW_LENGTH = 400
         private const val MP4_HEADER_MIN_BYTES = 8
         private const val MP4_BOX_TYPE_OFFSET = 4

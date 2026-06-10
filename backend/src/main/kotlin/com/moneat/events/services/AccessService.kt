@@ -77,9 +77,13 @@ class AccessService(
     suspend fun hasSpanAccess(userId: Int, projectId: Long): Boolean =
         hasProjectAccess(userId, projectId)
 
-    suspend fun hasReplayAccess(userId: Int, replayId: String): Boolean {
-        val projectId = replayService.getProjectIdForReplay(replayId) ?: return false
-        return hasProjectAccess(userId, projectId)
+    suspend fun hasReplayAccess(userId: Int, replayId: String): Boolean =
+        getReplayAccessProjectId(userId, replayId) != null
+
+    /** Resolves project ID when the user may access the replay (single ClickHouse lookup). */
+    suspend fun getReplayAccessProjectId(userId: Int, replayId: String): Long? {
+        val projectId = replayService.getProjectIdForReplay(replayId) ?: return null
+        return projectId.takeIf { hasProjectAccess(userId, it) }
     }
 
     suspend fun hasFeedbackAccess(userId: Int, feedbackId: String): Boolean {

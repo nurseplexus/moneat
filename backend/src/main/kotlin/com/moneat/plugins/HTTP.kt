@@ -24,6 +24,9 @@ import io.ktor.server.application.ApplicationCall
 import io.ktor.server.application.ApplicationCallPipeline
 import io.ktor.server.application.call
 import io.ktor.server.application.install
+import io.ktor.server.plugins.compression.Compression
+import io.ktor.server.plugins.compression.deflate
+import io.ktor.server.plugins.compression.gzip
 import io.ktor.server.plugins.cors.routing.CORS
 import mu.KotlinLogging
 
@@ -31,6 +34,11 @@ private val logger = KotlinLogging.logger {}
 
 fun Application.configureHTTP() {
     val frontendUrl = EnvConfig.get("FRONTEND_URL")!!
+
+    install(Compression) {
+        gzip()
+        deflate()
+    }
 
     install(CORS) {
         allowMethod(HttpMethod.Options)

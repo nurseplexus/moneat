@@ -983,12 +983,18 @@ fun Route.apiRoutes() {
                         return@get
                     }
 
-                    if (!isDemo && !dashboardService.hasReplayAccess(userId, replayId)) {
-                        call.respond(HttpStatusCode.Forbidden)
-                        return@get
-                    }
+                    val projectId =
+                        if (isDemo) {
+                            null
+                        } else {
+                            dashboardService.getReplayAccessProjectId(userId, replayId)
+                                ?: run {
+                                    call.respond(HttpStatusCode.Forbidden)
+                                    return@get
+                                }
+                        }
 
-                    val recording = dashboardService.getReplayRecording(replayId)
+                    val recording = dashboardService.getReplayRecording(replayId, projectId)
                     if (recording == null) {
                         call.respond(HttpStatusCode.NotFound)
                     } else {

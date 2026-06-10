@@ -143,6 +143,33 @@ class ReplayServiceExtendedTest {
     }
 
     @Test
+    fun `getReplayRecording skips project lookup when project id is known`() = runBlocking {
+        val jsonLine = """[{"type":2,"data":{"tag":"x"}}]"""
+        val segmentRow =
+            buildJsonObject {
+                put("recording_data", JsonPrimitive(jsonLine))
+            }.toString()
+        var replayEventsLookupCount = 0
+        withClickHouseMockServer({ exchange ->
+            val query = exchange.requestBodyText()
+            when {
+                query.contains("replay_segments") ->
+                    exchange.respond(200, segmentRow, TEXT_PLAIN)
+                query.contains("replay_events") && !query.contains("GROUP BY") -> {
+                    replayEventsLookupCount++
+                    exchange.respond(200, """{"project_id":1}""", TEXT_PLAIN)
+                }
+                else ->
+                    exchange.respond(200, "", TEXT_PLAIN)
+            }
+        }) {
+            val result = service.getReplayRecording(REPLAY_UUID, knownProjectId = 1L)
+            assertNotNull(result)
+            assertEquals(0, replayEventsLookupCount)
+        }
+    }
+
+    @Test
     fun `getReplayRecording returns null when project id cannot be resolved`() = runBlocking {
         withClickHouseMockServer({ exchange ->
             exchange.respond(200, "", TEXT_PLAIN)

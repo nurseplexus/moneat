@@ -94,6 +94,9 @@ class DashboardService(
     suspend fun hasReplayAccess(userId: Int, replayId: String): Boolean =
         accessService.hasReplayAccess(userId, replayId)
 
+    suspend fun getReplayAccessProjectId(userId: Int, replayId: String): Long? =
+        accessService.getReplayAccessProjectId(userId, replayId)
+
     suspend fun hasFeedbackAccess(userId: Int, feedbackId: String): Boolean =
         accessService.hasFeedbackAccess(userId, feedbackId)
 
@@ -244,8 +247,10 @@ class DashboardService(
         demoEpochMs: Long? = null
     ): ReplayTimelineResponse = replayService.getReplayTimeline(replayId, demoEpochMs)
 
-    suspend fun getReplayRecording(replayId: String): ReplayRecordingResponse? =
-        replayService.getReplayRecording(replayId)
+    suspend fun getReplayRecording(
+        replayId: String,
+        knownProjectId: Long? = null,
+    ): ReplayRecordingResponse? = replayService.getReplayRecording(replayId, knownProjectId)
 
     suspend fun getReplaysForIssue(
         issueId: String,
