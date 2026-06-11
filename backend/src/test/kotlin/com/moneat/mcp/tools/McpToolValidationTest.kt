@@ -31,12 +31,15 @@ import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.jsonPrimitive
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.junit.jupiter.api.BeforeEach
 import org.junit.jupiter.api.Test
+import kotlin.uuid.Uuid
+import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertTrue
 
@@ -45,6 +48,7 @@ class McpToolValidationTest {
         private const val CONTENT_TYPE_TEXT_PLAIN = "text/plain"
         private const val EVENT_ID = "01234567-89ab-cdef-0123-456789abcdef"
         private const val TRACE_ID = "trace-1"
+        private const val PROJECT_RESOURCE_ID = "018f4ce4-3f2a-7a67-a32b-0c1848f62b9d"
         private var db: Database? = null
     }
 
@@ -78,6 +82,7 @@ class McpToolValidationTest {
             Projects.insert {
                 it[id] = 1
                 it[organization_id] = 1
+                it[resource_id] = Uuid.parse(PROJECT_RESOURCE_ID)
                 it[name] = "Test Project"
                 it[slug] = "test-project"
             }
@@ -151,13 +156,20 @@ class McpToolValidationTest {
             ClickHouseClient.init(server.baseUrl, "test", "default", "")
 
             val result = GetTraceTool().execute(
-                obj("trace_id" to TRACE_ID, "project_id" to 1),
+                obj("trace_id" to TRACE_ID, "project_id" to PROJECT_RESOURCE_ID),
                 context
             )
 
             assertFalse(result.isError)
             assertTrue(result.content.first().text.orEmpty().contains(TRACE_ID))
         }
+    }
+
+    @Test
+    fun `project id schemas accept resource IDs only`() {
+        val projectIdSchema = projectIdInputSchema().properties["project_id"] as JsonObject
+
+        assertEquals("string", projectIdSchema["type"]?.jsonPrimitive?.content)
     }
 
     @Test
@@ -256,20 +268,62 @@ class McpToolValidationTest {
                 "status is required",
             ),
             case("update_dashboard_id", UpdateDashboardTool(), obj(), "dashboard_id is required"),
-            case("update_dashboard_fields", UpdateDashboardTool(), obj("dashboard_id" to 1), "At least one"),
+            case("update_dashboard_fields", UpdateDashboardTool(), obj("dashboard_id" to uuid), "At least one"),
             case("delete_dashboard_id", DeleteDashboardTool(), obj(), "dashboard_id is required"),
+            case(
+                "create_dashboard_widget_type",
+                CreateDashboardWidgetTool(),
+                obj("dashboard_id" to uuid),
+                "widget_type is required",
+            ),
+            case(
+                "create_dashboard_widget_unknown_type",
+                CreateDashboardWidgetTool(),
+                obj("dashboard_id" to uuid, "widget_type" to "bad"),
+                "Unknown widget_type",
+            ),
+            case(
+                "update_dashboard_widget_id",
+                UpdateDashboardWidgetTool(),
+                obj("dashboard_id" to uuid),
+                "widget_id is required",
+            ),
+            case(
+                "update_dashboard_widget_fields",
+                UpdateDashboardWidgetTool(),
+                obj("dashboard_id" to uuid, "widget_id" to uuid),
+                "At least one widget field",
+            ),
+            case(
+                "delete_dashboard_widget_id",
+                DeleteDashboardWidgetTool(),
+                obj("dashboard_id" to uuid),
+                "widget_id is required",
+            ),
+            case(
+                "preview_dashboard_widget_query_config",
+                PreviewDashboardWidgetQueryTool(),
+                obj("dashboard_id" to uuid),
+                "query_config must be an object",
+            ),
+            case(
+                "replace_dashboard_widgets_expected",
+                ReplaceDashboardWidgetsTool(),
+                obj("dashboard_id" to uuid, "widgets" to emptyList<String>()),
+                "expected_widget_count is required",
+            ),
             case(
                 "create_dashboard_alert_widget",
                 CreateDashboardAlertTool(),
-                obj("dashboard_id" to 1),
+                obj("dashboard_id" to uuid),
                 "widget_id is required",
             ),
             case(
                 "create_dashboard_alert_threshold",
                 CreateDashboardAlertTool(),
                 obj(
-                    "dashboard_id" to 1,
-                    "widget_id" to 2,
+                    "dashboard_id" to uuid,
+                    "widget_id" to uuid,
                     "name" to "CPU",
                     "condition" to "gt",
                     "threshold" to "bad",
@@ -280,8 +334,8 @@ class McpToolValidationTest {
                 "create_dashboard_alert_duration",
                 CreateDashboardAlertTool(),
                 obj(
-                    "dashboard_id" to 1,
-                    "widget_id" to 2,
+                    "dashboard_id" to uuid,
+                    "widget_id" to uuid,
                     "name" to "CPU",
                     "condition" to "gt",
                     "threshold" to 90,
@@ -292,25 +346,25 @@ class McpToolValidationTest {
             case(
                 "update_dashboard_alert_id",
                 UpdateDashboardAlertTool(),
-                obj("dashboard_id" to 1),
+                obj("dashboard_id" to uuid),
                 "alert_id is required",
             ),
             case(
                 "update_dashboard_alert_enabled",
                 UpdateDashboardAlertTool(),
-                obj("dashboard_id" to 1, "alert_id" to 2, "enabled" to "yes"),
+                obj("dashboard_id" to uuid, "alert_id" to uuid, "enabled" to "yes"),
                 "enabled must be true or false",
             ),
             case(
                 "update_dashboard_alert_fields",
                 UpdateDashboardAlertTool(),
-                obj("dashboard_id" to 1, "alert_id" to 2),
+                obj("dashboard_id" to uuid, "alert_id" to uuid),
                 "At least one field",
             ),
             case(
                 "delete_dashboard_alert_id",
                 DeleteDashboardAlertTool(),
-                obj("dashboard_id" to 1),
+                obj("dashboard_id" to uuid),
                 "alert_id is required",
             ),
             case("create_alert_host", CreateAlertTool(), obj(), "host_id is required"),
@@ -366,6 +420,12 @@ class McpToolValidationTest {
             ),
             case("create_uptime_name", CreateUptimeMonitorTool(), obj(), "name is required"),
             case("create_uptime_url", CreateUptimeMonitorTool(), obj("name" to "API"), "url is required"),
+            case("get_synthetic_id", GetSyntheticTestTool(), obj(), "synthetic_test_id is required"),
+            case("update_synthetic_id", UpdateSyntheticTestTool(), obj(), "synthetic_test_id is required"),
+            case("delete_synthetic_id", DeleteSyntheticTestTool(), obj(), "synthetic_test_id is required"),
+            case("run_synthetic_id", RunSyntheticTestTool(), obj(), "synthetic_test_id is required"),
+            case("synthetic_summary_id", GetSyntheticTestSummaryTool(), obj(), "synthetic_test_id is required"),
+            case("list_transactions_project_id", ListTransactionsTool(), obj(), "project_id is required"),
             case("get_trace_lookup", GetTraceTool(), obj(), "event_id or trace_id is required"),
             case(
                 "get_trace_project_id",
@@ -373,6 +433,14 @@ class McpToolValidationTest {
                 obj("trace_id" to TRACE_ID),
                 "project_id is required when trace_id is used without event_id",
             ),
+            case("transaction_stats_project_id", GetTransactionStatsTool(), obj(), "project_id is required"),
+            case("list_issues_project_id", ListIssuesTool(), obj(), "project_id is required"),
+            case("list_releases_project_id", ListReleasesTool(), obj(), "project_id is required"),
+            case("release_stats_project_id", GetReleaseStatsTool(), obj(), "project_id is required"),
+            case("get_project_project_id", GetProjectTool(), obj(), "project_id is required"),
+            case("get_project_stats_project_id", GetProjectStatsTool(), obj(), "project_id is required"),
+            case("list_feedback_project_id", ListFeedbackTool(), obj(), "project_id is required"),
+            case("execute_dashboard_query_project_id", ExecuteDashboardQueryTool(), obj(), "project_id is required"),
             case("create_datasource_name", CreateDataSourceTool(), obj(), "name is required"),
             case(
                 "create_datasource_type",
@@ -414,6 +482,63 @@ class McpToolValidationTest {
             ),
             case("create_feature_flag_key", CreateFeatureFlagTool(), obj(), "key is required"),
             case(
+                "create_feature_flag_environment_key",
+                CreateFeatureFlagEnvironmentTool(),
+                obj(),
+                "key is required",
+            ),
+            case("get_feature_flag_key", GetFeatureFlagTool(), obj(), "flag_key is required"),
+            case(
+                "get_feature_flag_analytics_hours",
+                GetFeatureFlagAnalyticsTool(),
+                obj("hours" to 0),
+                "hours must be greater than 0",
+            ),
+            case("update_feature_flag_key", UpdateFeatureFlagTool(), obj(), "flag_key is required"),
+            case("delete_feature_flag_key", DeleteFeatureFlagTool(), obj(), "flag_key is required"),
+            case(
+                "update_feature_flag_config_key",
+                UpdateFeatureFlagConfigTool(),
+                obj(),
+                "flag_key is required",
+            ),
+            case(
+                "update_feature_flag_config_environment",
+                UpdateFeatureFlagConfigTool(),
+                obj("flag_key" to "checkout.enabled"),
+                "environment is required",
+            ),
+            case(
+                "upsert_feature_flag_segment_key",
+                UpsertFeatureFlagSegmentTool(),
+                obj(),
+                "key is required",
+            ),
+            case(
+                "delete_feature_flag_segment_key",
+                DeleteFeatureFlagSegmentTool(),
+                obj(),
+                "segment_key is required",
+            ),
+            case(
+                "create_feature_flag_sdk_key_environment",
+                CreateFeatureFlagSdkKeyTool(),
+                obj(),
+                "environment_key is required",
+            ),
+            case(
+                "create_feature_flag_sdk_key_type",
+                CreateFeatureFlagSdkKeyTool(),
+                obj("environment_key" to "production", "name" to "Server"),
+                "key_type must be one of",
+            ),
+            case(
+                "revoke_feature_flag_sdk_key_id",
+                RevokeFeatureFlagSdkKeyTool(),
+                obj(),
+                "sdk_key_id is required",
+            ),
+            case(
                 "create_feature_flag_value_type",
                 CreateFeatureFlagTool(),
                 obj("key" to "checkout.enabled", "name" to "Checkout Enabled"),
@@ -441,6 +566,19 @@ class McpToolValidationTest {
                 ),
                 "variants must be an array",
             ),
+            case("create_workflow_name", CreateWorkflowTool(), obj(), "name is required"),
+            case("update_workflow_id", UpdateWorkflowTool(), obj(), "workflow_id is required"),
+            case("delete_workflow_id", DeleteWorkflowTool(), obj(), "workflow_id is required"),
+            case("publish_workflow_id", PublishWorkflowTool(), obj(), "workflow_id is required"),
+            case("run_workflow_id", RunWorkflowTool(), obj(), "workflow_id is required"),
+            case(
+                "cancel_workflow_run_id",
+                CancelWorkflowRunTool(),
+                obj("workflow_id" to 1),
+                "run_id is required",
+            ),
+            case("list_workflow_runs_id", ListWorkflowRunsTool(), obj(), "workflow_id is required"),
+            case("get_workflow_blueprint_key", GetWorkflowBlueprintTool(), obj(), "key is required"),
         )
     }
 

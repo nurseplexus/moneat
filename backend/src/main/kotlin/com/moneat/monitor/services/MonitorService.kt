@@ -16,6 +16,7 @@
 
 package com.moneat.monitor.services
 
+import com.moneat.alerts.models.AlertPriority
 import com.moneat.billing.models.PricingTier
 import com.moneat.billing.models.PricingTierConfigResponse
 import com.moneat.billing.services.PricingTierService
@@ -41,6 +42,7 @@ import com.moneat.shared.services.CacheService
 import com.moneat.shared.services.RetentionPolicyService
 import com.moneat.utils.ClickHouseSqlUtils.escapeSql
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import mu.KotlinLogging
@@ -58,6 +60,25 @@ class MonitorService(
     private val pricingTierService: PricingTierService = PricingTierService(),
     private val retentionPolicyService: RetentionPolicyService = RetentionPolicyService(),
 ) {
+    private fun resolvedAlertPriority(request: CreateAlertRequest): String? =
+        canonicalAlertPriority(
+            request.alertPriority
+                ?: request.alertPrioritySnake
+                ?: request.incidentSeverity
+                ?: request.legacyIncidentSeveritySnake
+        )
+
+    private fun resolvedAlertPriority(request: UpdateAlertRequest): String? =
+        canonicalAlertPriority(
+            request.alertPriority
+                ?: request.alertPrioritySnake
+                ?: request.incidentSeverity
+                ?: request.legacyIncidentSeveritySnake
+        )
+
+    private fun canonicalAlertPriority(priority: String?): String? =
+        priority?.let { AlertPriority.fromString(it)?.wire }
+
     private data class DefaultAlertTemplate(
         val metric: String,
         val condition: String,
@@ -169,6 +190,7 @@ class MonitorService(
         private const val CONT_HIST_COL_NET_SENT = 5
 
         private const val PERCENT_MULTIPLIER = 100
+        private const val DATETIME64_MILLIS_PRECISION = 3
     }
 
     private val clickhouseDb: String get() = ClickHouseClient.getDatabase()
@@ -373,9 +395,14 @@ class MonitorService(
      * Get latest metrics for multiple hosts in a single ClickHouse query (avoids N+1).
      * Returns a map from hostId to LatestMetrics (null if no data for that host).
      */
-    suspend fun getLatestMetricsForHosts(hostIds: List<Int>, organizationId: Int): Map<Int, LatestMetrics?> {
+    suspend fun getLatestMetricsForHosts(
+        hostIds: List<Int>,
+        organizationId: Int,
+        demoEpochMs: Long? = null,
+    ): Map<Int, LatestMetrics?> {
         if (hostIds.isEmpty()) return emptyMap()
         val hostIdList = hostIds.joinToString(",")
+        val freshnessNow = latestMetricsNowClause(demoEpochMs)
         val query =
             """
             SELECT
@@ -396,7 +423,7 @@ class MonitorService(
             WHERE organization_id = $organizationId
               AND host_id IN ($hostIdList)
               AND metric_name IN ($LATEST_METRIC_NAMES_SQL)
-              AND timestamp >= now64(3) - INTERVAL $LATEST_METRICS_LOOKBACK_HOURS HOUR
+              AND timestamp >= $freshnessNow - INTERVAL $LATEST_METRICS_LOOKBACK_HOURS HOUR
             GROUP BY host_id
             FORMAT JSONCompact
             """.trimIndent()
@@ -410,52 +437,67 @@ class MonitorService(
                 ?: return hostIds.associateWith { null }
             val result = mutableMapOf<Int, LatestMetrics?>()
             for (row in rows) {
-                val arr = row.jsonArray
-                val rowHostId = arr.getOrNull(0)?.toString()?.replace("\"", "")?.toIntOrNull() ?: continue
-                val cpuPercent = arr.getOrNull(1)?.toString()?.toFloatOrNull() ?: 0f
-                val memTotal = arr.getOrNull(2)?.toString()?.replace("\"", "")?.toLongOrNull() ?: 0L
-                val memUsed =
-                    arr.getOrNull(BATCH_COL_MEM_USED)?.toString()?.replace("\"", "")?.toLongOrNull() ?: 0L
-                val memAvailable =
-                    arr.getOrNull(BATCH_COL_MEM_AVAILABLE)?.toString()?.replace("\"", "")?.toLongOrNull() ?: 0L
-                val diskTotal =
-                    arr.getOrNull(BATCH_COL_DISK_TOTAL)?.toString()?.replace("\"", "")?.toLongOrNull() ?: 0L
-                val diskUsed =
-                    arr.getOrNull(BATCH_COL_DISK_USED)?.toString()?.replace("\"", "")?.toLongOrNull() ?: 0L
-                val netRecvBytes =
-                    arr.getOrNull(BATCH_COL_NET_RECV_BYTES)?.toString()?.replace("\"", "")?.toLongOrNull() ?: 0L
-                val netSentBytes =
-                    arr.getOrNull(BATCH_COL_NET_SENT_BYTES)?.toString()?.replace("\"", "")?.toLongOrNull() ?: 0L
-                val load1 = arr.getOrNull(BATCH_COL_LOAD_1)?.toString()?.toFloatOrNull() ?: 0f
-                val tempMax = arr.getOrNull(BATCH_COL_TEMP_MAX)?.toString()?.toFloatOrNull()
-                val gpuPercent = arr.getOrNull(BATCH_COL_GPU_PERCENT)?.toString()?.toFloatOrNull()
-                val batteryPercent = arr.getOrNull(BATCH_COL_BATTERY_PERCENT)?.toString()?.toFloatOrNull()
-                val effectiveMemUsed = if (memAvailable > 0) memTotal - memAvailable else memUsed
-                result[rowHostId] = LatestMetrics(
-                    cpuPercent = cpuPercent,
-                    memTotal = memTotal,
-                    memUsed = effectiveMemUsed,
-                    memPercent = if (memTotal > 0) {
-                        effectiveMemUsed.toFloat() / memTotal * PERCENT_MULTIPLIER
-                    } else { 0f },
-                    diskTotal = diskTotal,
-                    diskUsed = diskUsed,
-                    diskPercent = if (diskTotal > 0) (diskUsed.toFloat() / diskTotal * PERCENT_MULTIPLIER) else 0f,
-                    netRecvBytes = netRecvBytes,
-                    netSentBytes = netSentBytes,
-                    netRecvMbps = null,
-                    netSentMbps = null,
-                    load1 = load1,
-                    tempMax = tempMax,
-                    gpuPercent = gpuPercent,
-                    batteryPercent = batteryPercent
-                )
+                latestMetricsFromBatchRow(row.jsonArray)?.let { (hostId, metrics) ->
+                    result[hostId] = metrics
+                }
             }
             hostIds.associateWith { result[it] }
         }.getOrElse { e ->
             logger.warn(e) { "Failed to parse batch latest metrics response" }
             hostIds.associateWith { null }
         }
+    }
+
+    private fun latestMetricsFromBatchRow(arr: JsonArray): Pair<Int, LatestMetrics>? {
+        val rowHostId = arr.stringAt(0).toIntOrNull() ?: return null
+        val memTotal = arr.longAt(2)
+        val memUsed = arr.longAt(BATCH_COL_MEM_USED)
+        val memAvailable = arr.longAt(BATCH_COL_MEM_AVAILABLE)
+        val diskTotal = arr.longAt(BATCH_COL_DISK_TOTAL)
+        val diskUsed = arr.longAt(BATCH_COL_DISK_USED)
+        val effectiveMemUsed = if (memAvailable > 0) memTotal - memAvailable else memUsed
+        return rowHostId to LatestMetrics(
+            cpuPercent = arr.floatAt(1) ?: 0f,
+            memTotal = memTotal,
+            memUsed = effectiveMemUsed,
+            memPercent = percent(effectiveMemUsed, memTotal),
+            diskTotal = diskTotal,
+            diskUsed = diskUsed,
+            diskPercent = percent(diskUsed, diskTotal),
+            netRecvBytes = arr.longAt(BATCH_COL_NET_RECV_BYTES),
+            netSentBytes = arr.longAt(BATCH_COL_NET_SENT_BYTES),
+            netRecvMbps = null,
+            netSentMbps = null,
+            load1 = arr.floatAt(BATCH_COL_LOAD_1) ?: 0f,
+            tempMax = arr.floatAt(BATCH_COL_TEMP_MAX),
+            gpuPercent = arr.floatAt(BATCH_COL_GPU_PERCENT),
+            batteryPercent = arr.floatAt(BATCH_COL_BATTERY_PERCENT),
+        )
+    }
+
+    private fun JsonArray.stringAt(index: Int): String =
+        getOrNull(index)?.toString()?.replace("\"", "") ?: ""
+
+    private fun JsonArray.longAt(index: Int): Long =
+        stringAt(index).toLongOrNull() ?: 0L
+
+    private fun JsonArray.floatAt(index: Int): Float? =
+        stringAt(index).toFloatOrNull()
+
+    private fun percent(value: Long, total: Long): Float =
+        if (total > 0L) value.toFloat() / total * PERCENT_MULTIPLIER else 0f
+
+    private fun latestMetricsNowClause(demoEpochMs: Long?): String =
+        if (demoEpochMs != null) {
+            "toDateTime64(${formatEpochSeconds(demoEpochMs)}, $DATETIME64_MILLIS_PRECISION)"
+        } else {
+            "now64($DATETIME64_MILLIS_PRECISION)"
+        }
+
+    private fun formatEpochSeconds(epochMs: Long): String {
+        val seconds = epochMs / MILLIS_PER_SECOND_LONG
+        val millis = epochMs % MILLIS_PER_SECOND_LONG
+        return "$seconds.${millis.toString().padStart(DATETIME64_MILLIS_PRECISION, '0')}"
     }
 
     /**
@@ -969,6 +1011,7 @@ class MonitorService(
         if (scope == ALERT_SCOPE_GLOBAL) {
             ensureOrganizationAlertTemplates(organizationId)
             val now = Clock.System.now()
+            val alertPriority = resolvedAlertPriority(request)
             val alertId = hostAlertRepository.createAlert(
                 CreateAlertData(
                     hostId = hostId,
@@ -978,6 +1021,7 @@ class MonitorService(
                     threshold = request.threshold,
                     durationSeconds = request.durationSeconds,
                     enabled = request.enabled,
+                    alertPriority = alertPriority,
                     scope = ALERT_SCOPE_GLOBAL
                 )
             )
@@ -990,6 +1034,7 @@ class MonitorService(
                 threshold = request.threshold,
                 durationSeconds = request.durationSeconds,
                 enabled = request.enabled,
+                alertPriority = alertPriority,
                 lastTriggeredAt = null,
                 createdAt = now.toEpochMilliseconds()
             )
@@ -997,6 +1042,7 @@ class MonitorService(
 
         ensureHostAlertsSeeded(hostId, organizationId)
         val now = Clock.System.now()
+        val alertPriority = resolvedAlertPriority(request)
         val alertId = hostAlertRepository.createAlert(
             CreateAlertData(
                 hostId = hostId,
@@ -1006,6 +1052,7 @@ class MonitorService(
                 threshold = request.threshold,
                 durationSeconds = request.durationSeconds,
                 enabled = request.enabled,
+                alertPriority = alertPriority,
                 scope = ALERT_SCOPE_HOST
             )
         )
@@ -1018,6 +1065,7 @@ class MonitorService(
             threshold = request.threshold,
             durationSeconds = request.durationSeconds,
             enabled = request.enabled,
+            alertPriority = alertPriority,
             lastTriggeredAt = null,
             createdAt = now.toEpochMilliseconds()
         )
@@ -1042,7 +1090,8 @@ class MonitorService(
                 condition = request.condition,
                 threshold = request.threshold,
                 durationSeconds = request.durationSeconds,
-                enabled = request.enabled
+                enabled = request.enabled,
+                alertPriority = resolvedAlertPriority(request)
             ),
             scope
         )
@@ -1078,6 +1127,7 @@ class MonitorService(
                     threshold = template.threshold,
                     durationSeconds = template.durationSeconds,
                     enabled = template.enabled,
+                    alertPriority = null,
                     scope = ALERT_SCOPE_GLOBAL
                 )
             )
@@ -1102,6 +1152,7 @@ class MonitorService(
                     threshold = template.threshold,
                     durationSeconds = template.durationSeconds,
                     enabled = template.enabled,
+                    alertPriority = null,
                     scope = ALERT_SCOPE_HOST
                 )
             }
@@ -1115,6 +1166,7 @@ class MonitorService(
                     threshold = template.threshold,
                     durationSeconds = template.durationSeconds,
                     enabled = template.enabled,
+                    alertPriority = template.alertPriority,
                     scope = ALERT_SCOPE_HOST
                 )
             }
@@ -1144,6 +1196,7 @@ class MonitorService(
                 threshold = row.threshold,
                 durationSeconds = row.durationSeconds,
                 enabled = row.enabled,
+                alertPriority = row.alertPriority,
                 lastTriggeredAt = row.lastTriggeredAt?.toEpochMilliseconds(),
                 createdAt = row.createdAt.toEpochMilliseconds()
             )
@@ -1163,6 +1216,7 @@ class MonitorService(
                 threshold = row.threshold,
                 durationSeconds = row.durationSeconds,
                 enabled = row.enabled,
+                alertPriority = row.alertPriority,
                 lastTriggeredAt = row.lastTriggeredAt?.toEpochMilliseconds(),
                 createdAt = row.createdAt.toEpochMilliseconds()
             )

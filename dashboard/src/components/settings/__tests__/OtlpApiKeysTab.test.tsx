@@ -23,6 +23,8 @@ import {clearAuthStorage, renderWithQueryClient} from '@/test/utils'
 import {OtlpApiKeysTab} from '../OtlpApiKeysTab'
 
 const API_BASE = 'http://localhost:8080'
+const WEB_APP_RESOURCE_ID = '123e4567-e89b-12d3-a456-426614174030'
+const WORKER_RESOURCE_ID = '123e4567-e89b-12d3-a456-426614174031'
 
 function mockBaseResponses() {
   server.use(
@@ -50,8 +52,22 @@ function mockBaseResponses() {
     }),
     http.get(`${API_BASE}/v1/projects`, () => {
       return HttpResponse.json([
-        {id: 30, name: 'Web App', slug: 'web-app', framework: 'react', keys: [], dsn: ''},
-        {id: 31, name: 'Worker', slug: 'worker', framework: 'kotlin', keys: [], dsn: ''},
+        {
+          id: WEB_APP_RESOURCE_ID,
+          name: 'Web App',
+          slug: 'web-app',
+          framework: 'react',
+          keys: [],
+          dsn: '',
+        },
+        {
+          id: WORKER_RESOURCE_ID,
+          name: 'Worker',
+          slug: 'worker',
+          framework: 'kotlin',
+          keys: [],
+          dsn: '',
+        },
       ])
     }),
     http.get(`${API_BASE}/v1/otlp/services`, () => {
@@ -63,10 +79,12 @@ function mockBaseResponses() {
             service_namespace: 'checkout',
             service_name: 'api',
             project_id: 30,
+            project_resource_id: WEB_APP_RESOURCE_ID,
             project_name: 'Web App',
             seen_logs: true,
             seen_traces: true,
             seen_metrics: false,
+            seen_feedback: true,
             last_environment: 'production',
             first_seen_at: '2026-01-01T00:00:00Z',
             last_seen_at: '2026-01-01T01:00:00Z',
@@ -81,6 +99,7 @@ function mockBaseResponses() {
             seen_logs: false,
             seen_traces: false,
             seen_metrics: true,
+            seen_feedback: false,
             last_environment: null,
             first_seen_at: '2026-01-01T00:00:00Z',
             last_seen_at: '2026-01-01T01:00:00Z',
@@ -120,6 +139,7 @@ describe('OtlpApiKeysTab', () => {
     expect(screen.getByText('logs')).toBeInTheDocument()
     expect(screen.getByText('traces')).toBeInTheDocument()
     expect(screen.getByText('metrics')).toBeInTheDocument()
+    expect(screen.getByText('feedback')).toBeInTheDocument()
     expect(screen.getByRole('button', {name: 'Remove mapping for checkout/api'})).toBeEnabled()
     expect(screen.getByRole('button', {name: 'Remove mapping for worker'})).toBeDisabled()
   })
@@ -154,7 +174,7 @@ describe('OtlpApiKeysTab', () => {
     })
   })
 
-  it('maps an unmapped service from the project selector', async () => {
+  it('maps an unmapped service from the service selector', async () => {
     let capturedBody: Record<string, unknown> | null = null
     const user = userEvent.setup()
     server.use(
@@ -181,7 +201,7 @@ describe('OtlpApiKeysTab', () => {
       expect(capturedBody).toEqual({
         service_name: 'worker',
         service_namespace: '',
-        project_id: 31,
+        project_resource_id: WORKER_RESOURCE_ID,
       })
     })
   })

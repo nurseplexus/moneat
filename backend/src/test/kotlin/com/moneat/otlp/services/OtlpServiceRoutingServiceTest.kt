@@ -22,8 +22,10 @@ import com.moneat.shared.models.OtelObservedServices
 import com.moneat.shared.models.OtelServiceProjectMappings
 import com.moneat.shared.models.Projects
 import com.moneat.testsupport.TestDatabaseHelper
+import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import kotlin.test.BeforeTest
@@ -163,6 +165,30 @@ class OtlpServiceRoutingServiceTest {
     }
 
     @Test
+    fun `resolveProjectIds marks feedback on an existing observed service`() {
+        val serviceDescriptor = OtlpServiceDescriptor(
+            serviceNamespace = "checkout",
+            serviceName = "checkout-api",
+            environment = "production"
+        )
+
+        service.resolveProjectIds(
+            organizationId = orgOne.id,
+            services = listOf(serviceDescriptor),
+            signalType = OtlpSignalType.TRACES
+        )
+        service.resolveProjectIds(
+            organizationId = orgOne.id,
+            services = listOf(serviceDescriptor),
+            signalType = OtlpSignalType.FEEDBACK
+        )
+
+        val observed = service.listObservedServices(orgOne.id).single()
+        assertTrue(observed.seenTraces)
+        assertTrue(observed.seenFeedback)
+    }
+
+    @Test
     fun `upsertMapping only accepts a valid service and project in the organization`() {
         val unknownServiceMapping = service.upsertMapping(
             organizationId = orgOne.id,
@@ -212,6 +238,38 @@ class OtlpServiceRoutingServiceTest {
     }
 
     @Test
+    fun `upsertMapping accepts project resource ID`() {
+        val resourceId = projectResourceId(orgOne.projects.first())
+        val mapping = service.upsertMapping(
+            organizationId = orgOne.id,
+            request = CreateOtlpServiceMappingRequest(
+                serviceName = "checkout-api",
+                serviceNamespace = "checkout",
+                projectResourceId = resourceId
+            )
+        )
+
+        assertNotNull(mapping)
+        assertEquals(orgOne.projects.first(), mapping.projectId)
+        assertEquals(resourceId, mapping.projectResourceId)
+
+        service.resolveProjectIds(
+            organizationId = orgOne.id,
+            services = listOf(
+                OtlpServiceDescriptor(
+                    serviceNamespace = "checkout",
+                    serviceName = "checkout-api",
+                    environment = "production"
+                )
+            ),
+            signalType = OtlpSignalType.TRACES
+        )
+
+        val observed = service.listObservedServices(orgOne.id).single()
+        assertEquals(resourceId, observed.projectResourceId)
+    }
+
+    @Test
     fun `deleteMapping removes only mappings in the organization`() {
         val mapping = service.upsertMapping(
             organizationId = orgOne.id,
@@ -246,6 +304,14 @@ class OtlpServiceRoutingServiceTest {
             } get Projects.id
         }
         OrgProjects(orgId, projects)
+    }
+
+    private fun projectResourceId(projectId: Long): String = transaction {
+        Projects
+            .selectAll()
+            .where { Projects.id eq projectId }
+            .first()[Projects.resource_id]
+            .toString()
     }
 
     private data class OrgProjects(

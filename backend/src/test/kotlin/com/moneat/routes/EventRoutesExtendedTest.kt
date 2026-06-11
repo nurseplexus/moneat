@@ -18,6 +18,7 @@ package com.moneat.routes
 
 import com.auth0.jwt.JWT
 import com.auth0.jwt.algorithms.Algorithm
+import com.moneat.events.models.AlertNotificationPreference
 import com.moneat.events.models.FeedbackDetailResponse
 import com.moneat.events.models.FeedbackListItem
 import com.moneat.events.models.ProjectKeyResponse
@@ -45,6 +46,7 @@ import com.moneat.shared.models.Organizations
 import com.moneat.shared.models.Projects
 import com.moneat.shared.models.Users
 import com.moneat.testsupport.RouteTestSupport
+import com.moneat.testsupport.RouteTestSupport.installApiRouteRateLimits
 import com.moneat.testsupport.RouteTestSupport.installJwtAuth
 import com.moneat.testsupport.RouteTestSupport.withAuth
 import com.moneat.testsupport.TestDatabaseHelper
@@ -61,9 +63,6 @@ import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
 import io.ktor.server.application.Application
-import io.ktor.server.application.install
-import io.ktor.server.plugins.ratelimit.RateLimit
-import io.ktor.server.plugins.ratelimit.RateLimitName
 import io.ktor.server.routing.routing
 import io.ktor.server.testing.testApplication
 import io.mockk.coEvery
@@ -74,8 +73,13 @@ import io.mockk.mockk
 import io.mockk.runs
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.int
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import org.koin.core.context.loadKoinModules
@@ -85,7 +89,6 @@ import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
-import kotlin.time.Duration.Companion.seconds
 
 class EventRoutesExtendedTest {
     companion object {
@@ -101,10 +104,17 @@ class EventRoutesExtendedTest {
         private const val REPLAY_D1 = "replay-d1"
         private const val TIMESTAMP_2026_01_01 = "2026-01-01T00:00:00Z"
         private const val URL_EXAMPLE_COM = "https://example.com"
+        private const val TEST_PROJECT_RESOURCE_ID = "018f4ce4-3f2a-7a67-a32b-0c1848f62b9d"
     }
 
     private val mockDashboardService = mockk<DashboardService>(relaxed = true)
     private val mockAlertPrefsService = mockk<AlertNotificationPreferencesService>(relaxed = true)
+
+    private data class SeededUserProject(
+        val userId: Int,
+        val orgId: Int,
+        val projectId: Long
+    )
 
     @BeforeTest
     fun setup() {
@@ -139,17 +149,27 @@ class EventRoutesExtendedTest {
 
     private fun Application.installTestApp() {
         installJwtAuth()
-        install(RateLimit) {
-            register(RateLimitName("api")) {
-                requestKey { "test-user" }
-                rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-            }
-        }
-        routing { apiRoutes() }
+        installApiRouteRateLimits("test-user")
+        routing { apiRoutes(includePublicContactRoutes = false) }
     }
 
     private fun token(userId: Int): String =
-        RouteTestSupport.createToken(userId)
+        RouteTestSupport.createToken(userId = userId, orgId = orgIdForUser(userId))
+
+    private fun token(
+        userId: Int,
+        orgId: Int
+    ): String =
+        RouteTestSupport.createToken(userId = userId, orgId = orgId)
+
+    private fun orgIdForUser(userId: Int): Int? =
+        transaction {
+            Memberships
+                .selectAll()
+                .where { Memberships.user_id eq userId }
+                .firstOrNull()
+                ?.get(Memberships.organization_id)
+        }
 
     private fun demoToken(): String =
         JWT.create().withIssuer("moneat").withAudience("moneat-users")
@@ -158,7 +178,10 @@ class EventRoutesExtendedTest {
             .withClaim("isDemo", true)
             .sign(Algorithm.HMAC256(RouteTestSupport.TEST_JWT_SECRET))
 
-    private fun seedUserWithProject(): Pair<Int, Long> {
+    private fun seedUserWithProject(): Pair<Int, Long> =
+        seedUserProject().let { it.userId to it.projectId }
+
+    private fun seedUserProject(): SeededUserProject {
         val orgId = transaction {
             Organizations.insert {
                 it[name] = "Ext Test Org"
@@ -186,21 +209,35 @@ class EventRoutesExtendedTest {
                 it[slug] = "ext-project-${System.nanoTime()}"
             } get Projects.id
         }
-        return Pair(userId, projectId)
+        return SeededUserProject(userId = userId, orgId = orgId, projectId = projectId)
     }
+
+    private fun projectResourceId(projectId: Long): String = transaction {
+        Projects
+            .selectAll()
+            .where { Projects.id eq projectId }
+            .first()[Projects.resource_id]
+            .toString()
+    }
+
+    private fun projectApiPath(projectId: Long, suffix: String = ""): String =
+        "$V1_PROJECTS/${projectResourceId(projectId)}$suffix"
+
+    private fun serviceIdsQuery(vararg projectIds: Long): String =
+        projectIds.joinToString(",") { projectResourceId(it) }
 
     // ──── GET /v1/projects ────
 
     @Test
     fun `GET projects returns 200 with project list`() = testApplication {
-        val (userId, _) = seedUserWithProject()
+        val seeded = seedUserProject()
         coEvery {
-            mockDashboardService.getProjects(userId, any())
+            mockDashboardService.getProjects(seeded.orgId, any())
         } returns listOf(sampleProject())
 
         application { installTestApp() }
         val response = client.get(V1_PROJECTS) {
-            withAuth(token(userId))
+            withAuth(token(seeded.userId, seeded.orgId))
         }
         assertEquals(HttpStatusCode.OK, response.status)
         assertTrue(response.bodyAsText().contains(TEST_PROJECT_NAME))
@@ -217,14 +254,14 @@ class EventRoutesExtendedTest {
 
     @Test
     fun `POST projects returns 201 on success`() = testApplication {
-        val (userId, _) = seedUserWithProject()
+        val seeded = seedUserProject()
         coEvery {
-            mockDashboardService.createProject(userId, any())
+            mockDashboardService.createProject(seeded.orgId, any())
         } returns sampleProject()
 
         application { installTestApp() }
         val response = client.post(V1_PROJECTS) {
-            withAuth(token(userId))
+            withAuth(token(seeded.userId, seeded.orgId))
             contentType(ContentType.Application.Json)
             setBody("""{"name":"New Project"}""")
         }
@@ -234,14 +271,14 @@ class EventRoutesExtendedTest {
 
     @Test
     fun `POST projects returns 403 when project limit reached`() = testApplication {
-        val (userId, _) = seedUserWithProject()
+        val seeded = seedUserProject()
         coEvery {
-            mockDashboardService.createProject(userId, any())
+            mockDashboardService.createProject(seeded.orgId, any())
         } throws IllegalStateException("project_limit_reached")
 
         application { installTestApp() }
         val response = client.post(V1_PROJECTS) {
-            withAuth(token(userId))
+            withAuth(token(seeded.userId, seeded.orgId))
             contentType(ContentType.Application.Json)
             setBody("""{"name":"New Project"}""")
         }
@@ -251,14 +288,14 @@ class EventRoutesExtendedTest {
 
     @Test
     fun `POST projects returns 400 on other errors`() = testApplication {
-        val (userId, _) = seedUserWithProject()
+        val seeded = seedUserProject()
         coEvery {
-            mockDashboardService.createProject(userId, any())
+            mockDashboardService.createProject(seeded.orgId, any())
         } throws IllegalStateException("Invalid project name")
 
         application { installTestApp() }
         val response = client.post(V1_PROJECTS) {
-            withAuth(token(userId))
+            withAuth(token(seeded.userId, seeded.orgId))
             contentType(ContentType.Application.Json)
             setBody("""{"name":""}""")
         }
@@ -274,7 +311,7 @@ class EventRoutesExtendedTest {
         coEvery { mockDashboardService.getProject(projectId) } returns sampleProject()
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$projectId") {
+        val response = client.get(projectApiPath(projectId)) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.OK, response.status)
@@ -282,11 +319,11 @@ class EventRoutesExtendedTest {
 
     @Test
     fun `GET project detail returns 403 without access`() = testApplication {
-        val (userId, _) = seedUserWithProject()
-        every { mockDashboardService.hasProjectAccess(userId, SENTINEL_ID) } returns false
+        val (userId, projectId) = seedUserWithProject()
+        every { mockDashboardService.hasProjectAccess(userId, projectId) } returns false
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$SENTINEL_ID") {
+        val response = client.get(projectApiPath(projectId)) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.Forbidden, response.status)
@@ -299,7 +336,7 @@ class EventRoutesExtendedTest {
         coEvery { mockDashboardService.getProject(projectId) } returns null
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$projectId") {
+        val response = client.get(projectApiPath(projectId)) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.NotFound, response.status)
@@ -325,7 +362,7 @@ class EventRoutesExtendedTest {
         every { mockDashboardService.updateProject(projectId, any()) } just runs
 
         application { installTestApp() }
-        val response = client.put("/v1/projects/$projectId") {
+        val response = client.put(projectApiPath(projectId)) {
             withAuth(token(userId))
             contentType(ContentType.Application.Json)
             setBody("""{"name":"Updated Name"}""")
@@ -335,11 +372,11 @@ class EventRoutesExtendedTest {
 
     @Test
     fun `PUT project returns 403 without access`() = testApplication {
-        val (userId, _) = seedUserWithProject()
-        every { mockDashboardService.hasProjectAccess(userId, SENTINEL_ID) } returns false
+        val (userId, projectId) = seedUserWithProject()
+        every { mockDashboardService.hasProjectAccess(userId, projectId) } returns false
 
         application { installTestApp() }
-        val response = client.put("/v1/projects/$SENTINEL_ID") {
+        val response = client.put(projectApiPath(projectId)) {
             withAuth(token(userId))
             contentType(ContentType.Application.Json)
             setBody("""{"name":"Updated Name"}""")
@@ -356,7 +393,7 @@ class EventRoutesExtendedTest {
         every { mockDashboardService.deleteProject(projectId) } just runs
 
         application { installTestApp() }
-        val response = client.delete("/v1/projects/$projectId") {
+        val response = client.delete(projectApiPath(projectId)) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.NoContent, response.status)
@@ -364,11 +401,11 @@ class EventRoutesExtendedTest {
 
     @Test
     fun `DELETE project returns 403 without access`() = testApplication {
-        val (userId, _) = seedUserWithProject()
-        every { mockDashboardService.hasProjectAccess(userId, SENTINEL_ID) } returns false
+        val (userId, projectId) = seedUserWithProject()
+        every { mockDashboardService.hasProjectAccess(userId, projectId) } returns false
 
         application { installTestApp() }
-        val response = client.delete("/v1/projects/$SENTINEL_ID") {
+        val response = client.delete(projectApiPath(projectId)) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.Forbidden, response.status)
@@ -385,7 +422,7 @@ class EventRoutesExtendedTest {
         } returns ProjectKeyResponse(platformTarget = "flutter", dsn = DSN_KEY_AT_HOST)
 
         application { installTestApp() }
-        val response = client.post("/v1/projects/$projectId/targets") {
+        val response = client.post(projectApiPath(projectId, "/targets")) {
             withAuth(token(userId))
             contentType(ContentType.Application.Json)
             setBody("""{"target":"flutter"}""")
@@ -403,7 +440,7 @@ class EventRoutesExtendedTest {
         } throws IllegalStateException("Target already exists")
 
         application { installTestApp() }
-        val response = client.post("/v1/projects/$projectId/targets") {
+        val response = client.post(projectApiPath(projectId, "/targets")) {
             withAuth(token(userId))
             contentType(ContentType.Application.Json)
             setBody("""{"target":"flutter"}""")
@@ -422,7 +459,7 @@ class EventRoutesExtendedTest {
         } returns sampleProjectStats()
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$projectId/stats") {
+        val response = client.get(projectApiPath(projectId, "/stats")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.OK, response.status)
@@ -431,11 +468,11 @@ class EventRoutesExtendedTest {
 
     @Test
     fun `GET project stats returns 403 without access`() = testApplication {
-        val (userId, _) = seedUserWithProject()
-        every { mockDashboardService.hasProjectAccess(userId, SENTINEL_ID) } returns false
+        val (userId, projectId) = seedUserWithProject()
+        every { mockDashboardService.hasProjectAccess(userId, projectId) } returns false
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$SENTINEL_ID/stats") {
+        val response = client.get(projectApiPath(projectId, "/stats")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.Forbidden, response.status)
@@ -450,7 +487,7 @@ class EventRoutesExtendedTest {
         } returns sampleProjectStats()
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$projectId/stats?period=24h") {
+        val response = client.get(projectApiPath(projectId, "/stats?period=24h")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.OK, response.status)
@@ -468,7 +505,7 @@ class EventRoutesExtendedTest {
         } returns sampleTraceDetail(projectId)
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$projectId/traces/$TRACE_ABC") {
+        val response = client.get(projectApiPath(projectId, "/traces/$TRACE_ABC")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.OK, response.status)
@@ -481,7 +518,7 @@ class EventRoutesExtendedTest {
         coEvery { mockDashboardService.hasTraceAccess(userId, projectId) } returns false
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$projectId/traces/$TRACE_ABC") {
+        val response = client.get(projectApiPath(projectId, "/traces/$TRACE_ABC")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.Forbidden, response.status)
@@ -494,7 +531,7 @@ class EventRoutesExtendedTest {
         coEvery { mockDashboardService.getTraceDetails(projectId, "missing") } returns null
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$projectId/traces/missing") {
+        val response = client.get(projectApiPath(projectId, "/traces/missing")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.NotFound, response.status)
@@ -511,7 +548,7 @@ class EventRoutesExtendedTest {
         } returns sampleSpanDetail()
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$projectId/spans/span-abc") {
+        val response = client.get(projectApiPath(projectId, "/spans/span-abc")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.OK, response.status)
@@ -524,7 +561,7 @@ class EventRoutesExtendedTest {
         coEvery { mockDashboardService.hasSpanAccess(userId, projectId) } returns false
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$projectId/spans/span-abc") {
+        val response = client.get(projectApiPath(projectId, "/spans/span-abc")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.Forbidden, response.status)
@@ -537,7 +574,7 @@ class EventRoutesExtendedTest {
         coEvery { mockDashboardService.getSpanDetails(projectId, "missing") } returns null
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$projectId/spans/missing") {
+        val response = client.get(projectApiPath(projectId, "/spans/missing")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.NotFound, response.status)
@@ -554,7 +591,7 @@ class EventRoutesExtendedTest {
         } returns listOf(sampleReplayListItem(projectId))
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$projectId/replays") {
+        val response = client.get(projectApiPath(projectId, "/replays")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.OK, response.status)
@@ -563,11 +600,11 @@ class EventRoutesExtendedTest {
 
     @Test
     fun `GET replays returns 403 without access`() = testApplication {
-        val (userId, _) = seedUserWithProject()
-        every { mockDashboardService.hasProjectAccess(userId, SENTINEL_ID) } returns false
+        val (userId, projectId) = seedUserWithProject()
+        every { mockDashboardService.hasProjectAccess(userId, projectId) } returns false
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$SENTINEL_ID/replays") {
+        val response = client.get(projectApiPath(projectId, "/replays")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.Forbidden, response.status)
@@ -582,7 +619,7 @@ class EventRoutesExtendedTest {
         } returns emptyList()
 
         application { installTestApp() }
-        val url = "/v1/projects/$projectId/replays?page=2&limit=10&environment=production&period=30d"
+        val url = projectApiPath(projectId, "/replays?page=2&limit=10&environment=production&period=30d")
         val response = client.get(url) {
             withAuth(token(userId))
         }
@@ -590,6 +627,57 @@ class EventRoutesExtendedTest {
         coVerify {
             mockDashboardService.getReplays(projectId, 2, 10, "production", "30d", any())
         }
+    }
+
+    @Test
+    fun `GET org replays filters to requested services`() = testApplication {
+        val seed = seedUserProject()
+        every { mockDashboardService.getServiceIdsForOrganization(seed.orgId) } returns
+            listOf(seed.projectId, SENTINEL_ID)
+        coEvery {
+            mockDashboardService.getReplaysForServices(
+                seed.orgId,
+                listOf(seed.projectId),
+                2,
+                10,
+                "production",
+                "30d",
+                any()
+            )
+        } returns listOf(sampleReplayListItem(seed.projectId))
+
+        application { installTestApp() }
+        val serviceId = projectResourceId(seed.projectId)
+        val url = "/v1/replays?page=2&limit=10&environment=production&period=30d&serviceId=$serviceId"
+        val response = client.get(url) {
+            withAuth(token(seed.userId, seed.orgId))
+        }
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(response.bodyAsText().contains("replay-1"))
+        coVerify {
+            mockDashboardService.getReplaysForServices(
+                seed.orgId,
+                listOf(seed.projectId),
+                2,
+                10,
+                "production",
+                "30d",
+                any()
+            )
+        }
+    }
+
+    @Test
+    fun `GET org replays returns 400 for invalid service id`() = testApplication {
+        val seed = seedUserProject()
+
+        application { installTestApp() }
+        val response = client.get("/v1/replays?serviceIds=not-a-service") {
+            withAuth(token(seed.userId, seed.orgId))
+        }
+
+        assertEquals(HttpStatusCode.BadRequest, response.status)
     }
 
     @Test
@@ -714,7 +802,7 @@ class EventRoutesExtendedTest {
         } returns listOf(sampleFeedbackListItem())
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$projectId/feedback") {
+        val response = client.get(projectApiPath(projectId, "/feedback")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.OK, response.status)
@@ -722,12 +810,47 @@ class EventRoutesExtendedTest {
     }
 
     @Test
-    fun `GET feedback list returns 403 without access`() = testApplication {
-        val (userId, _) = seedUserWithProject()
-        every { mockDashboardService.hasProjectAccess(userId, SENTINEL_ID) } returns false
+    fun `GET org feedback resolves service names`() = testApplication {
+        val seed = seedUserProject()
+        every { mockDashboardService.resolveServiceId(seed.orgId, "checkout") } returns seed.projectId
+        every { mockDashboardService.getServiceIdsForOrganization(seed.orgId) } returns listOf(seed.projectId)
+        coEvery {
+            mockDashboardService.getFeedbackForServices(
+                seed.orgId,
+                listOf(seed.projectId),
+                1,
+                25,
+                "resolved",
+                any()
+            )
+        } returns listOf(sampleFeedbackListItem())
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$SENTINEL_ID/feedback") {
+        val response = client.get("/v1/feedback?services=checkout&status=resolved") {
+            withAuth(token(seed.userId, seed.orgId))
+        }
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(response.bodyAsText().contains("fb-1"))
+        coVerify {
+            mockDashboardService.getFeedbackForServices(
+                seed.orgId,
+                listOf(seed.projectId),
+                1,
+                25,
+                "resolved",
+                any()
+            )
+        }
+    }
+
+    @Test
+    fun `GET feedback list returns 403 without access`() = testApplication {
+        val (userId, projectId) = seedUserWithProject()
+        every { mockDashboardService.hasProjectAccess(userId, projectId) } returns false
+
+        application { installTestApp() }
+        val response = client.get(projectApiPath(projectId, "/feedback")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.Forbidden, response.status)
@@ -814,7 +937,7 @@ class EventRoutesExtendedTest {
         } returns listOf(sampleRelease())
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$projectId/releases") {
+        val response = client.get(projectApiPath(projectId, "/releases")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.OK, response.status)
@@ -822,12 +945,32 @@ class EventRoutesExtendedTest {
     }
 
     @Test
-    fun `GET releases returns 403 without access`() = testApplication {
-        val (userId, _) = seedUserWithProject()
-        every { mockDashboardService.hasProjectAccess(userId, SENTINEL_ID) } returns false
+    fun `GET org releases uses all organization services`() = testApplication {
+        val seed = seedUserProject()
+        every { mockDashboardService.getServiceIdsForOrganization(seed.orgId) } returns listOf(seed.projectId)
+        coEvery {
+            mockDashboardService.getReleasesForServices(seed.orgId, listOf(seed.projectId), any())
+        } returns listOf(sampleRelease())
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$SENTINEL_ID/releases") {
+        val response = client.get("/v1/releases") {
+            withAuth(token(seed.userId, seed.orgId))
+        }
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(response.bodyAsText().contains("1.0.0"))
+        coVerify {
+            mockDashboardService.getReleasesForServices(seed.orgId, listOf(seed.projectId), any())
+        }
+    }
+
+    @Test
+    fun `GET releases returns 403 without access`() = testApplication {
+        val (userId, projectId) = seedUserWithProject()
+        every { mockDashboardService.hasProjectAccess(userId, projectId) } returns false
+
+        application { installTestApp() }
+        val response = client.get(projectApiPath(projectId, "/releases")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.Forbidden, response.status)
@@ -842,11 +985,49 @@ class EventRoutesExtendedTest {
         } returns sampleReleaseStats()
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$projectId/releases/1.0.0/stats") {
+        val response = client.get(projectApiPath(projectId, "/releases/1.0.0/stats")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.OK, response.status)
         assertTrue(response.bodyAsText().contains("1.0.0"))
+    }
+
+    @Test
+    fun `GET org release stats filters service ids to organization services`() = testApplication {
+        val seed = seedUserProject()
+        val other = seedUserProject()
+        every { mockDashboardService.getServiceIdsForOrganization(seed.orgId) } returns listOf(seed.projectId)
+        coEvery {
+            mockDashboardService.getReleaseStatsForServices(seed.orgId, listOf(seed.projectId), "1.0.0")
+        } returns sampleReleaseStats()
+
+        application { installTestApp() }
+        val serviceIds = serviceIdsQuery(seed.projectId, other.projectId)
+        val response = client.get("/v1/releases/1.0.0/stats?serviceIds=$serviceIds") {
+            withAuth(token(seed.userId, seed.orgId))
+        }
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(response.bodyAsText().contains("1.0.0"))
+        coVerify {
+            mockDashboardService.getReleaseStatsForServices(seed.orgId, listOf(seed.projectId), "1.0.0")
+        }
+    }
+
+    @Test
+    fun `GET org release stats returns 404 when not found`() = testApplication {
+        val seed = seedUserProject()
+        every { mockDashboardService.getServiceIdsForOrganization(seed.orgId) } returns listOf(seed.projectId)
+        coEvery {
+            mockDashboardService.getReleaseStatsForServices(seed.orgId, listOf(seed.projectId), "9.9.9")
+        } returns null
+
+        application { installTestApp() }
+        val response = client.get("/v1/releases/9.9.9/stats") {
+            withAuth(token(seed.userId, seed.orgId))
+        }
+
+        assertEquals(HttpStatusCode.NotFound, response.status)
     }
 
     @Test
@@ -856,7 +1037,7 @@ class EventRoutesExtendedTest {
         coEvery { mockDashboardService.getReleaseStats(projectId, "9.9.9") } returns null
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$projectId/releases/9.9.9/stats") {
+        val response = client.get(projectApiPath(projectId, "/releases/9.9.9/stats")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.NotFound, response.status)
@@ -864,11 +1045,11 @@ class EventRoutesExtendedTest {
 
     @Test
     fun `GET release stats returns 403 without access`() = testApplication {
-        val (userId, _) = seedUserWithProject()
-        every { mockDashboardService.hasProjectAccess(userId, SENTINEL_ID) } returns false
+        val (userId, projectId) = seedUserWithProject()
+        every { mockDashboardService.hasProjectAccess(userId, projectId) } returns false
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/$SENTINEL_ID/releases/1.0.0/stats") {
+        val response = client.get(projectApiPath(projectId, "/releases/1.0.0/stats")) {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.Forbidden, response.status)
@@ -878,14 +1059,17 @@ class EventRoutesExtendedTest {
 
     @Test
     fun `GET user returns 200 with user data`() = testApplication {
-        val (userId, _) = seedUserWithProject()
+        val seeded = seedUserProject()
 
         application { installTestApp() }
         val response = client.get("/v1/user") {
-            withAuth(token(userId))
+            withAuth(token(seeded.userId))
         }
         assertEquals(HttpStatusCode.OK, response.status)
-        assertTrue(response.bodyAsText().contains("email"))
+        val body = response.bodyAsText()
+        assertTrue(body.contains("email"))
+        val userJson = Json.parseToJsonElement(body).jsonObject
+        assertEquals(seeded.orgId, userJson["orgId"]?.jsonPrimitive?.int, "Response should include orgId: $body")
     }
 
     @Test
@@ -910,6 +1094,29 @@ class EventRoutesExtendedTest {
     }
 
     @Test
+    fun `GET notification-preferences returns project resource IDs`() = testApplication {
+        val (userId, projectId) = seedUserWithProject()
+        val resourceId = projectResourceId(projectId)
+        transaction {
+            NotificationPreferences.insert {
+                it[user_id] = userId
+                it[project_id] = projectId
+                it[issue_alerts] = false
+            }
+        }
+
+        application { installTestApp() }
+        val response = client.get("/v1/notification-preferences") {
+            withAuth(token(userId))
+        }
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        val body = response.bodyAsText()
+        assertTrue(body.contains(resourceId))
+        assertTrue(body.contains("Ext Test Project"))
+    }
+
+    @Test
     fun `PUT notification-preferences returns 401 without auth`() = testApplication {
         application { installTestApp() }
         val response = client.put("/v1/notification-preferences") {
@@ -931,11 +1138,11 @@ class EventRoutesExtendedTest {
 
     @Test
     fun `PUT project notification-preferences returns 403 without access`() = testApplication {
-        val (userId, _) = seedUserWithProject()
-        every { mockDashboardService.hasProjectAccess(userId, SENTINEL_ID) } returns false
+        val (userId, projectId) = seedUserWithProject()
+        every { mockDashboardService.hasProjectAccess(userId, projectId) } returns false
 
         application { installTestApp() }
-        val response = client.put("/v1/notification-preferences/$SENTINEL_ID") {
+        val response = client.put("/v1/notification-preferences/${projectResourceId(projectId)}") {
             withAuth(token(userId))
             contentType(ContentType.Application.Json)
             setBody(ISSUE_ALERTS_FALSE)
@@ -949,7 +1156,7 @@ class EventRoutesExtendedTest {
         every { mockDashboardService.hasProjectAccess(userId, projectId) } returns true
 
         application { installTestApp() }
-        val response = client.delete("/v1/notification-preferences/$projectId") {
+        val response = client.delete("/v1/notification-preferences/${projectResourceId(projectId)}") {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.NoContent, response.status)
@@ -957,11 +1164,11 @@ class EventRoutesExtendedTest {
 
     @Test
     fun `DELETE project notification-preferences returns 403 without access`() = testApplication {
-        val (userId, _) = seedUserWithProject()
-        every { mockDashboardService.hasProjectAccess(userId, SENTINEL_ID) } returns false
+        val (userId, projectId) = seedUserWithProject()
+        every { mockDashboardService.hasProjectAccess(userId, projectId) } returns false
 
         application { installTestApp() }
-        val response = client.delete("/v1/notification-preferences/$SENTINEL_ID") {
+        val response = client.delete("/v1/notification-preferences/${projectResourceId(projectId)}") {
             withAuth(token(userId))
         }
         assertEquals(HttpStatusCode.Forbidden, response.status)
@@ -984,16 +1191,49 @@ class EventRoutesExtendedTest {
         assertTrue(response.bodyAsText().contains("preferences"))
     }
 
+    @Test
+    fun `PUT alert-notification-preferences uses JWT org`() = testApplication {
+        val seeded = seedUserProject()
+        every {
+            mockAlertPrefsService.updatePreference(
+                userId = seeded.userId,
+                organizationId = seeded.orgId,
+                alertSource = "uptime",
+                emailEnabled = false,
+                slackEnabled = true,
+                discordEnabled = false
+            )
+        } returns AlertNotificationPreference(
+            alertSource = "uptime",
+            emailEnabled = false,
+            slackEnabled = true,
+            discordEnabled = false
+        )
+
+        application { installTestApp() }
+        val response =
+            client.put("/v1/alert-notification-preferences/uptime") {
+                withAuth(token(seeded.userId, seeded.orgId))
+                contentType(ContentType.Application.Json)
+                setBody("""{"emailEnabled":false,"slackEnabled":true,"discordEnabled":false}""")
+            }
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(response.bodyAsText().contains("uptime"))
+    }
+
     // ──── Demo user access ────
 
     @Test
     fun `demo user can access replays`() = testApplication {
+        val projectId = seedUserWithProject().second
+        val resourceId = projectResourceId(projectId)
         coEvery {
             mockDashboardService.getReplays(any(), any(), any(), any(), any(), any())
         } returns emptyList()
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/1/replays") {
+        val response = client.get("/v1/projects/$resourceId/replays") {
             withAuth(demoToken())
         }
         assertEquals(HttpStatusCode.OK, response.status)
@@ -1001,12 +1241,14 @@ class EventRoutesExtendedTest {
 
     @Test
     fun `demo user can access feedback`() = testApplication {
+        val projectId = seedUserWithProject().second
+        val resourceId = projectResourceId(projectId)
         coEvery {
             mockDashboardService.getFeedback(any(), any(), any(), any(), any())
         } returns emptyList()
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/1/feedback") {
+        val response = client.get("/v1/projects/$resourceId/feedback") {
             withAuth(demoToken())
         }
         assertEquals(HttpStatusCode.OK, response.status)
@@ -1014,12 +1256,14 @@ class EventRoutesExtendedTest {
 
     @Test
     fun `demo user can access project stats`() = testApplication {
+        val projectId = seedUserWithProject().second
+        val resourceId = projectResourceId(projectId)
         coEvery {
             mockDashboardService.getProjectStats(any(), any(), any(), any())
         } returns sampleProjectStats()
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/1/stats") {
+        val response = client.get("/v1/projects/$resourceId/stats") {
             withAuth(demoToken())
         }
         assertEquals(HttpStatusCode.OK, response.status)
@@ -1027,12 +1271,14 @@ class EventRoutesExtendedTest {
 
     @Test
     fun `demo user can access releases`() = testApplication {
+        val projectId = seedUserWithProject().second
+        val resourceId = projectResourceId(projectId)
         coEvery {
             mockDashboardService.getReleases(any(), any())
         } returns emptyList()
 
         application { installTestApp() }
-        val response = client.get("/v1/projects/1/releases") {
+        val response = client.get("/v1/projects/$resourceId/releases") {
             withAuth(demoToken())
         }
         assertEquals(HttpStatusCode.OK, response.status)
@@ -1041,7 +1287,7 @@ class EventRoutesExtendedTest {
     // ──── Helpers ────
 
     private fun sampleProject() = ProjectResponse(
-        id = 1L,
+        id = "018f4ce4-3f2a-7a67-a32b-0c1848f62b9d",
         name = TEST_PROJECT_NAME,
         slug = "test-project",
         framework = "kotlin",
@@ -1066,7 +1312,7 @@ class EventRoutesExtendedTest {
 
     private fun sampleTraceDetail(projectId: Long) = TraceDetailResponse(
         traceId = TRACE_ABC,
-        projectId = projectId,
+        projectId = projectResourceId(projectId),
         spans = listOf(
             SpanResponse(
                 spanId = "span-1",
@@ -1109,7 +1355,7 @@ class EventRoutesExtendedTest {
 
     private fun sampleReplayListItem(projectId: Long = 1L) = ReplayListItem(
         replayId = "replay-1",
-        projectId = projectId,
+        projectId = projectResourceId(projectId),
         startedAt = TIMESTAMP_2026_01_01,
         finishedAt = "2026-01-01T00:05:00Z",
         durationMs = 300000.0,
@@ -1125,7 +1371,7 @@ class EventRoutesExtendedTest {
 
     private fun sampleReplayDetail() = ReplayDetailResponse(
         replayId = REPLAY_D1,
-        projectId = 1L,
+        projectId = TEST_PROJECT_RESOURCE_ID,
         startedAt = TIMESTAMP_2026_01_01,
         finishedAt = "2026-01-01T00:05:00Z",
         durationMs = 300000.0,

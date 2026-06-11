@@ -25,12 +25,112 @@ export interface WorkflowStepConfig {
   params: Record<string, string>
 }
 
+export type WorkflowJsonValue =
+  | string
+  | number
+  | boolean
+  | null
+  | WorkflowJsonValue[]
+  | {[key: string]: WorkflowJsonValue}
+
+export interface WorkflowRetryConfig {
+  max_attempts: number
+  initial_interval: string
+  backoff_coefficient: number
+  maximum_interval?: string | null
+  non_retryable_error_types: string[]
+}
+
+export interface WorkflowSwitchCaseConfig {
+  name: string
+  label?: string | null
+  conditions: WorkflowConditionConfig[]
+}
+
+export interface WorkflowGraphPosition {
+  x: number
+  y: number
+}
+
+export interface WorkflowGraphNode {
+  id: string
+  type: 'trigger' | 'condition' | 'action' | 'control'
+  trigger?: string | null
+  kind?: string | null
+  action?: string | null
+  params?: Record<string, WorkflowJsonValue>
+  conditions?: WorkflowConditionConfig[]
+  cases?: WorkflowSwitchCaseConfig[]
+  retry?: WorkflowRetryConfig | null
+  continue_on_error?: boolean
+  position?: WorkflowGraphPosition | null
+}
+
+export interface WorkflowGraphEdge {
+  from: string
+  to: string
+  branch?: string | null
+  on?: string | null
+}
+
+export interface WorkflowGraphConfig {
+  nodes: WorkflowGraphNode[]
+  edges: WorkflowGraphEdge[]
+}
+
+export interface WorkflowPreviewRequest {
+  trigger_name: string
+  steps?: WorkflowStepConfig[]
+  scope?: Record<string, WorkflowJsonValue>
+  graph?: WorkflowGraphConfig | null
+  node_id?: string | null
+}
+
+export interface WorkflowPreviewField {
+  label: string
+  value: string
+}
+
+export interface WorkflowStepPreview {
+  step: string
+  channel: string
+  title: string
+  subject?: string | null
+  body: string
+  html_body?: string | null
+  text_body: string
+  fields: WorkflowPreviewField[]
+  color: string
+  cta_label?: string | null
+  cta_url?: string | null
+  footer?: string | null
+  fallback_text: string
+}
+
+export interface WorkflowPreviewResponse {
+  scope: Record<string, string>
+  previews: WorkflowStepPreview[]
+}
+
+export interface WorkflowTestMessageResult {
+  step: string
+  channel: string
+  status: string
+  error_message?: string | null
+}
+
+export interface WorkflowTestMessageResponse {
+  scope: Record<string, string>
+  results: WorkflowTestMessageResult[]
+}
+
 export interface WorkflowRequest {
   name: string
   trigger_name: string
   enabled: boolean
   conditions: WorkflowConditionConfig[]
   steps: WorkflowStepConfig[]
+  graph?: WorkflowGraphConfig | null
   once_for_template: string[]
 }
 
@@ -42,9 +142,11 @@ export interface WorkflowResponse {
   trigger_name: string
   enabled: boolean
   version: number
+  published: boolean
   system_key?: string | null
   conditions: WorkflowConditionConfig[]
   steps: WorkflowStepConfig[]
+  graph: WorkflowGraphConfig
   once_for_template: string[]
   created_at: string
   updated_at: string
@@ -55,8 +157,25 @@ export interface WorkflowResponse {
 export interface WorkflowRunStepProgress {
   step: string
   status: string
+  node_id?: string | null
+  type?: string | null
   completed_at?: string | null
+  output: Record<string, WorkflowJsonValue>
   error_message?: string | null
+}
+
+export interface WorkflowRunStepResponse {
+  id: number
+  run_id: number
+  node_id: string
+  type: string
+  status: string
+  started_at?: string | null
+  completed_at?: string | null
+  input: Record<string, WorkflowJsonValue>
+  output: Record<string, WorkflowJsonValue>
+  error_message?: string | null
+  attempt: number
 }
 
 export interface WorkflowRunResponse {
@@ -67,10 +186,30 @@ export interface WorkflowRunResponse {
   once_for: string
   status: string
   progress: WorkflowRunStepProgress[]
+  steps: WorkflowRunStepResponse[]
   error_message?: string | null
+  temporal_workflow_id?: string | null
+  temporal_run_id?: string | null
   created_at: string
   completed_at?: string | null
   failed_at?: string | null
+}
+
+export interface WorkflowRunInstanceRequest {
+  scope: Record<string, WorkflowJsonValue>
+}
+
+export interface WorkflowRunCancelResponse {
+  id: number
+  status: string
+}
+
+export interface WorkflowWebhookSigningResponse {
+  workflow_id: number
+  webhook_url: string
+  signing_secret: string
+  signature_header: string
+  signature_format: string
 }
 
 export interface WorkflowFieldConfig {
@@ -122,8 +261,95 @@ export interface WorkflowStepDefinition {
   params: WorkflowStepParamDefinition[]
 }
 
+export interface WorkflowNodeTypeDefinition {
+  type: string
+  kind?: string | null
+  name: string
+  label: string
+  description: string
+  params: WorkflowStepParamDefinition[]
+  branch_labels: string[]
+}
+
 export interface WorkflowCatalogResponse {
   resources: WorkflowResourceDefinition[]
   triggers: WorkflowTriggerDefinition[]
   steps: WorkflowStepDefinition[]
+  node_types: WorkflowNodeTypeDefinition[]
+}
+
+export interface WorkflowBlueprintSummary {
+  key: string
+  name: string
+  description: string
+  category: string
+  trigger_name: string
+  tags: string[]
+}
+
+export interface WorkflowBlueprintDetail extends WorkflowBlueprintSummary {
+  conditions: WorkflowConditionConfig[]
+  steps: WorkflowStepConfig[]
+  graph: WorkflowGraphConfig
+  once_for_template: string[]
+}
+
+export interface InstantiateBlueprintRequest {
+  name?: string
+}
+
+export interface WorkflowOverviewTopEntry {
+  workflow_id: number
+  name: string
+  run_count: number
+}
+
+export interface WorkflowOverviewResponse {
+  total_workflows: number
+  enabled_workflows: number
+  published_workflows: number
+  runs_last_30d: number
+  success_rate: number
+  failed_last_30d: number
+  top_workflows: WorkflowOverviewTopEntry[]
+}
+
+export interface WorkflowUsageResponse {
+  period: string
+  used: number
+  limit: number | null
+  remaining: number | null
+  unlimited: boolean
+}
+
+export interface WorkflowAuditEntry {
+  id: string
+  workflow_id?: number | null
+  run_id?: number | null
+  action: string
+  actor_user_id?: number | null
+  detail: Record<string, string>
+  created_at: string
+}
+
+export interface WorkflowExportResource {
+  name: string
+  trigger_name: string
+  enabled: boolean
+  graph: WorkflowGraphConfig
+  once_for_template: string[]
+}
+
+export interface WorkflowExportResponse {
+  schema_version: number
+  resource: WorkflowExportResource
+  terraform: string
+}
+
+export interface WorkflowImportRequest {
+  name: string
+  trigger_name: string
+  graph: WorkflowGraphConfig
+  enabled?: boolean
+  once_for_template?: string[]
 }

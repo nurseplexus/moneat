@@ -17,9 +17,11 @@
 package com.moneat.mcp.tools
 
 import com.moneat.dashboards.models.DashboardAlertResponse
+import com.moneat.dashboards.models.DashboardResponse
 import com.moneat.dashboards.models.DashboardWidgetAlerts
 import com.moneat.dashboards.models.DashboardWidgets
 import com.moneat.mcp.models.McpContext
+import com.moneat.mcp.protocol.McpTool
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
@@ -67,12 +69,43 @@ class DashboardCrudToolTest {
         transaction {
             exec("DROP TABLE IF EXISTS dashboard_widget_alerts")
             exec("DROP TABLE IF EXISTS dashboard_widgets")
+            exec("DROP TABLE IF EXISTS dashboard_favorites")
+            exec("DROP TABLE IF EXISTS custom_data_sources")
             exec("DROP TABLE IF EXISTS dashboards")
+            exec("DROP TABLE IF EXISTS projects")
             patchJsonbForH2(DashboardWidgets, DashboardWidgetAlerts)
+            exec(
+                """
+                CREATE TABLE projects (
+                    id BIGINT PRIMARY KEY,
+                    resource_id UUID NOT NULL,
+                    organization_id INT NOT NULL,
+                    name VARCHAR(255) NOT NULL,
+                    slug VARCHAR(255) NOT NULL,
+                    framework VARCHAR(50)
+                )
+                """.trimIndent()
+            )
+            exec(
+                """
+                INSERT INTO projects (id, resource_id, organization_id, name, slug, framework)
+                VALUES
+                    ($PROJECT_ID, '$PROJECT_RESOURCE_ID', $ORG_ID, 'Primary Project', 'primary-project', 'otel'),
+                    (
+                        $SECOND_PROJECT_ID,
+                        '$SECOND_PROJECT_RESOURCE_ID',
+                        $ORG_ID,
+                        'Other Project',
+                        'other-project',
+                        'otel'
+                    )
+                """.trimIndent()
+            )
             exec(
                 """
                 CREATE TABLE dashboards (
                     id BIGSERIAL PRIMARY KEY,
+                    resource_id UUID NOT NULL,
                     org_id BIGINT NOT NULL,
                     project_id BIGINT,
                     folder_id BIGINT,
@@ -89,8 +122,40 @@ class DashboardCrudToolTest {
             )
             exec(
                 """
+                CREATE TABLE dashboard_favorites (
+                    user_id INT NOT NULL,
+                    dashboard_id BIGINT NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    PRIMARY KEY (user_id, dashboard_id)
+                )
+                """.trimIndent()
+            )
+            exec(
+                """
+                CREATE TABLE custom_data_sources (
+                    id BIGSERIAL PRIMARY KEY,
+                    resource_id UUID NOT NULL,
+                    org_id BIGINT NOT NULL,
+                    name VARCHAR(255) NOT NULL,
+                    description TEXT,
+                    source_type VARCHAR(50) NOT NULL,
+                    host VARCHAR(512) NOT NULL,
+                    port INT,
+                    database_name VARCHAR(255),
+                    encrypted_credentials TEXT NOT NULL,
+                    extra_config TEXT NOT NULL,
+                    enabled BOOLEAN DEFAULT TRUE NOT NULL,
+                    created_by BIGINT NOT NULL,
+                    created_at TIMESTAMP NOT NULL,
+                    updated_at TIMESTAMP NOT NULL
+                )
+                """.trimIndent()
+            )
+            exec(
+                """
                 CREATE TABLE dashboard_widgets (
                     id BIGSERIAL PRIMARY KEY,
+                    resource_id UUID NOT NULL,
                     dashboard_id BIGINT NOT NULL,
                     title VARCHAR(255),
                     widget_type VARCHAR(50) NOT NULL,
@@ -111,6 +176,7 @@ class DashboardCrudToolTest {
                 """
                 CREATE TABLE dashboard_widget_alerts (
                     id BIGSERIAL PRIMARY KEY,
+                    resource_id UUID NOT NULL DEFAULT RANDOM_UUID(),
                     widget_id BIGINT NOT NULL,
                     dashboard_id BIGINT NOT NULL,
                     org_id BIGINT NOT NULL,
@@ -120,7 +186,7 @@ class DashboardCrudToolTest {
                     warning_threshold DOUBLE PRECISION,
                     metric_index INT DEFAULT 0 NOT NULL,
                     duration_seconds INT DEFAULT 0 NOT NULL,
-                    incident_severity VARCHAR(20),
+                    alert_priority VARCHAR(20),
                     enabled BOOLEAN DEFAULT TRUE NOT NULL,
                     notification_channels TEXT NOT NULL,
                     last_triggered_at TIMESTAMP,
@@ -138,20 +204,36 @@ class DashboardCrudToolTest {
     // ──── Tests ────
 
     @Test
-    fun `create dashboard alert accepts MCP condition and severity aliases`() = runBlocking {
+    fun `get dashboard templates returns generated catalog`() = runBlocking {
+        val result = GetDashboardTemplatesTool().execute(JsonObject(emptyMap()), context)
+
+        assertFalse(result.isError, result.content.first().text.orEmpty())
+        val templates = json.parseToJsonElement(result.content.first().text.orEmpty()).jsonArray
+        assertTrue(templates.size >= 100)
+        assertTrue(
+            templates.any {
+                val template = it.jsonObject
+                template["id"]?.jsonPrimitive?.content == "001-1860-node-exporter-full" &&
+                    template["title"]?.jsonPrimitive?.content == "Node Exporter Full"
+            }
+        )
+    }
+
+    @Test
+    fun `create dashboard alert accepts MCP condition and priority aliases`() = runBlocking {
         val dashboardId = seedDashboard()
         val widgetId = seedWidget(dashboardId)
 
         val result = CreateDashboardAlertTool().execute(
             JsonObject(
                 mapOf(
-                    "dashboard_id" to JsonPrimitive(dashboardId),
-                    "widget_id" to JsonPrimitive(widgetId),
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "widget_id" to JsonPrimitive(widgetResourceId(widgetId)),
                     "name" to JsonPrimitive("CPU high"),
                     "condition" to JsonPrimitive("gt"),
                     "threshold" to JsonPrimitive(0.85),
                     "duration_seconds" to JsonPrimitive(300),
-                    "incident_severity" to JsonPrimitive("P0")
+                    "alert_priority" to JsonPrimitive("P0")
                 )
             ),
             context
@@ -160,20 +242,20 @@ class DashboardCrudToolTest {
         val response = decodeAlert(result.content.first().text!!)
         assertFalse(result.isError)
         assertEquals(">", response.condition)
-        assertEquals("CRITICAL", response.incidentSeverity)
+        assertEquals("P0", response.alertPriority)
         assertEquals(300, response.durationSeconds)
     }
 
     @Test
-    fun `update dashboard alert can update duration severity and gte condition`() = runBlocking {
+    fun `update dashboard alert can update duration priority and gte condition`() = runBlocking {
         val dashboardId = seedDashboard()
         val widgetId = seedWidget(dashboardId)
         val created = decodeAlert(
             CreateDashboardAlertTool().execute(
                 JsonObject(
                     mapOf(
-                        "dashboard_id" to JsonPrimitive(dashboardId),
-                        "widget_id" to JsonPrimitive(widgetId),
+                        "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                        "widget_id" to JsonPrimitive(widgetResourceId(widgetId)),
                         "name" to JsonPrimitive("Heap high"),
                         "condition" to JsonPrimitive("gt"),
                         "threshold" to JsonPrimitive(0.85)
@@ -186,12 +268,12 @@ class DashboardCrudToolTest {
         val result = UpdateDashboardAlertTool().execute(
             JsonObject(
                 mapOf(
-                    "dashboard_id" to JsonPrimitive(dashboardId),
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
                     "alert_id" to JsonPrimitive(created.id),
                     "condition" to JsonPrimitive("gte"),
                     "threshold" to JsonPrimitive(0.9),
                     "duration_seconds" to JsonPrimitive(600),
-                    "incident_severity" to JsonPrimitive("P1"),
+                    "alert_priority" to JsonPrimitive("P1"),
                     "enabled" to JsonPrimitive(false)
                 )
             ),
@@ -203,20 +285,104 @@ class DashboardCrudToolTest {
         assertEquals(">=", response.condition)
         assertEquals(0.9, response.threshold)
         assertEquals(600, response.durationSeconds)
-        assertEquals("HIGH", response.incidentSeverity)
+        assertEquals("P1", response.alertPriority)
         assertFalse(response.enabled)
     }
 
     @Test
     fun `dashboard alert schemas advertise aliases they accept`() {
         val createConditionEnum = enumValues(CreateDashboardAlertTool().inputSchema.properties, "condition")
-        val updateSeverityEnum = enumValues(UpdateDashboardAlertTool().inputSchema.properties, "incident_severity")
+        val updatePriorityEnum = enumValues(UpdateDashboardAlertTool().inputSchema.properties, "alert_priority")
 
         assertTrue("gte" in createConditionEnum)
         assertTrue(">=" in createConditionEnum)
-        assertTrue("P0" in updateSeverityEnum)
-        assertTrue("P1" in updateSeverityEnum)
-        assertTrue("CRITICAL" in updateSeverityEnum)
+        assertTrue("P0" in updatePriorityEnum)
+        assertTrue("P1" in updatePriorityEnum)
+        assertTrue("CRITICAL" in updatePriorityEnum)
+    }
+
+    @Test
+    fun `dashboard CRUD tools require dashboard resource IDs`() = runBlocking {
+        val cases = listOf(
+            ToolCase(
+                UpdateDashboardTool(),
+                JsonObject(mapOf("title" to JsonPrimitive("Renamed"))),
+                "dashboard_id is required",
+            ),
+            ToolCase(
+                DeleteDashboardTool(),
+                JsonObject(emptyMap()),
+                "dashboard_id is required",
+            ),
+            ToolCase(
+                CreateDashboardAlertTool(),
+                JsonObject(
+                    mapOf(
+                        "widget_id" to JsonPrimitive(WIDGET_RESOURCE_ID),
+                        "name" to JsonPrimitive("CPU high"),
+                        "condition" to JsonPrimitive("gt"),
+                        "threshold" to JsonPrimitive(0.85),
+                    )
+                ),
+                "dashboard_id is required",
+            ),
+            ToolCase(
+                DeleteDashboardAlertTool(),
+                JsonObject(mapOf("alert_id" to JsonPrimitive(MISSING_ALERT_RESOURCE_ID))),
+                "dashboard_id is required",
+            ),
+        )
+
+        cases.forEach { case ->
+            assertToolError(case.tool, case.args, case.expectedMessage)
+        }
+    }
+
+    @Test
+    fun `dashboard CRUD tools report missing dashboard resource IDs`() = runBlocking {
+        val alertArgs = mapOf(
+            "dashboard_id" to JsonPrimitive(MISSING_DASHBOARD_RESOURCE_ID),
+            "widget_id" to JsonPrimitive(WIDGET_RESOURCE_ID),
+            "name" to JsonPrimitive("CPU high"),
+            "condition" to JsonPrimitive("gt"),
+            "threshold" to JsonPrimitive(0.85),
+        )
+        val cases = listOf(
+            ToolCase(
+                UpdateDashboardTool(),
+                JsonObject(
+                    mapOf(
+                        "dashboard_id" to JsonPrimitive(MISSING_DASHBOARD_RESOURCE_ID),
+                        "title" to JsonPrimitive("Renamed"),
+                    )
+                ),
+                "Dashboard not found",
+            ),
+            ToolCase(
+                DeleteDashboardTool(),
+                JsonObject(mapOf("dashboard_id" to JsonPrimitive(MISSING_DASHBOARD_RESOURCE_ID))),
+                "Dashboard not found",
+            ),
+            ToolCase(
+                CreateDashboardAlertTool(),
+                JsonObject(alertArgs),
+                "Dashboard not found",
+            ),
+            ToolCase(
+                DeleteDashboardAlertTool(),
+                JsonObject(
+                    mapOf(
+                        "dashboard_id" to JsonPrimitive(MISSING_DASHBOARD_RESOURCE_ID),
+                        "alert_id" to JsonPrimitive(MISSING_ALERT_RESOURCE_ID),
+                    )
+                ),
+                "Dashboard not found",
+            ),
+        )
+
+        cases.forEach { case ->
+            assertToolError(case.tool, case.args, case.expectedMessage)
+        }
     }
 
     @Test
@@ -227,8 +393,8 @@ class DashboardCrudToolTest {
         val result = CreateDashboardAlertTool().execute(
             JsonObject(
                 mapOf(
-                    "dashboard_id" to JsonPrimitive(dashboardId),
-                    "widget_id" to JsonPrimitive(widgetId),
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "widget_id" to JsonPrimitive(widgetResourceId(widgetId)),
                     "name" to JsonPrimitive("CPU high"),
                     "condition" to JsonPrimitive("above"),
                     "threshold" to JsonPrimitive(0.85)
@@ -245,19 +411,19 @@ class DashboardCrudToolTest {
     }
 
     @Test
-    fun `create dashboard alert rejects unknown severity aliases`() = runBlocking {
+    fun `create dashboard alert rejects unknown priority aliases`() = runBlocking {
         val dashboardId = seedDashboard()
         val widgetId = seedWidget(dashboardId)
 
         val result = CreateDashboardAlertTool().execute(
             JsonObject(
                 mapOf(
-                    "dashboard_id" to JsonPrimitive(dashboardId),
-                    "widget_id" to JsonPrimitive(widgetId),
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "widget_id" to JsonPrimitive(widgetResourceId(widgetId)),
                     "name" to JsonPrimitive("CPU high"),
                     "condition" to JsonPrimitive("gt"),
                     "threshold" to JsonPrimitive(0.85),
-                    "incident_severity" to JsonPrimitive("SEV0")
+                    "alert_priority" to JsonPrimitive("SEV0")
                 )
             ),
             context
@@ -265,13 +431,13 @@ class DashboardCrudToolTest {
 
         assertTrue(result.isError)
         assertEquals(
-            "Unknown dashboard alert severity: SEV0",
+            "Unknown dashboard alert priority: SEV0",
             result.content.first().text,
         )
     }
 
     @Test
-    fun `create dashboard alert accepts remaining condition and severity aliases`() = runBlocking {
+    fun `create dashboard alert accepts remaining condition and priority aliases`() = runBlocking {
         val dashboardId = seedDashboard()
         val widgetId = seedWidget(dashboardId)
         val conditionCases = listOf(
@@ -282,28 +448,28 @@ class DashboardCrudToolTest {
             "==" to "==",
             ">=" to ">=",
         )
-        val severityCases = listOf(
-            "P2" to "MEDIUM",
-            "MEDIUM" to "MEDIUM",
-            "P3" to "LOW",
-            "P4" to "LOW",
-            "P5" to "LOW",
-            "LOW" to "LOW",
-            "HIGH" to "HIGH",
-            "CRITICAL" to "CRITICAL",
+        val priorityCases = listOf(
+            "P2" to "P2",
+            "MEDIUM" to "P2",
+            "P3" to "P3",
+            "P4" to "P4",
+            "P5" to "P5",
+            "LOW" to "P3",
+            "HIGH" to "P1",
+            "CRITICAL" to "P0",
         )
 
-        severityCases.forEachIndexed { index, severityCase ->
+        priorityCases.forEachIndexed { index, priorityCase ->
             val conditionCase = conditionCases[index % conditionCases.size]
             val result = CreateDashboardAlertTool().execute(
                 JsonObject(
                     mapOf(
-                        "dashboard_id" to JsonPrimitive(dashboardId),
-                        "widget_id" to JsonPrimitive(widgetId),
+                        "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                        "widget_id" to JsonPrimitive(widgetResourceId(widgetId)),
                         "name" to JsonPrimitive("Alias alert $index"),
                         "condition" to JsonPrimitive(conditionCase.first),
                         "threshold" to JsonPrimitive(index.toDouble()),
-                        "incident_severity" to JsonPrimitive(severityCase.first)
+                        "alert_priority" to JsonPrimitive(priorityCase.first)
                     )
                 ),
                 context
@@ -312,7 +478,7 @@ class DashboardCrudToolTest {
             val response = decodeAlert(result.content.first().text!!)
             assertFalse(result.isError)
             assertEquals(conditionCase.second, response.condition)
-            assertEquals(severityCase.second, response.incidentSeverity)
+            assertEquals(priorityCase.second, response.alertPriority)
         }
     }
 
@@ -324,8 +490,8 @@ class DashboardCrudToolTest {
             CreateDashboardAlertTool().execute(
                 JsonObject(
                     mapOf(
-                        "dashboard_id" to JsonPrimitive(dashboardId),
-                        "widget_id" to JsonPrimitive(widgetId),
+                        "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                        "widget_id" to JsonPrimitive(widgetResourceId(widgetId)),
                         "name" to JsonPrimitive("Heap high"),
                         "condition" to JsonPrimitive("gt"),
                         "threshold" to JsonPrimitive(0.85)
@@ -335,7 +501,7 @@ class DashboardCrudToolTest {
             ).content.first().text!!
         )
         val baseArgs: Map<String, JsonElement> = mapOf(
-            "dashboard_id" to JsonPrimitive(dashboardId),
+            "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
             "alert_id" to JsonPrimitive(created.id),
         )
         val cases: List<Pair<Map<String, JsonElement>, String>> = listOf(
@@ -343,8 +509,8 @@ class DashboardCrudToolTest {
                 "duration_seconds must be a valid integer",
             mapOf("condition" to JsonPrimitive("above")) to
                 "Unknown dashboard alert condition: above",
-            mapOf("incident_severity" to JsonPrimitive("SEV0")) to
-                "Unknown dashboard alert severity: SEV0",
+            mapOf("alert_priority" to JsonPrimitive("SEV0")) to
+                "Unknown dashboard alert priority: SEV0",
             emptyMap<String, JsonElement>() to
                 "At least one field must be provided to update",
         )
@@ -360,15 +526,513 @@ class DashboardCrudToolTest {
         }
     }
 
+    @Test
+    fun `delete dashboard alert reports missing alert resource IDs`() = runBlocking {
+        val dashboardId = seedDashboard()
+
+        assertToolError(
+            DeleteDashboardAlertTool(),
+            JsonObject(
+                mapOf(
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "alert_id" to JsonPrimitive(MISSING_ALERT_RESOURCE_ID),
+                )
+            ),
+            "Alert not found",
+        )
+    }
+
+    @Test
+    fun `create dashboard widget appends below existing widgets`() = runBlocking {
+        val dashboardId = seedDashboard()
+        seedWidget(dashboardId)
+
+        val result = CreateDashboardWidgetTool().execute(
+            JsonObject(
+                mapOf(
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "title" to JsonPrimitive("Memory"),
+                    "widget_type" to JsonPrimitive("stat"),
+                    "query_configs" to JsonArray(listOf(queryDslJson("metrics"))),
+                    "display_config" to JsonObject(mapOf("unit" to JsonPrimitive("bytes"))),
+                )
+            ),
+            context
+        )
+
+        val dashboard = decodeDashboard(result.content.first().text!!)
+        val created = dashboard.widgets.single { it.title == "Memory" }
+        assertFalse(result.isError)
+        assertEquals(2, dashboard.widgets.size)
+        assertEquals("stat", created.widgetType)
+        assertEquals(4, created.gridY)
+        assertEquals("bytes", created.displayConfig["unit"])
+        assertEquals("metrics", created.queryConfigs.single().dataSource)
+    }
+
+    @Test
+    fun `update dashboard widget patches target and preserves sibling widgets`() = runBlocking {
+        val dashboardId = seedDashboard()
+        val firstWidgetId = seedWidget(dashboardId, title = "CPU")
+        val secondWidgetId = seedWidget(dashboardId, widgetId = WIDGET_ID + 1, title = "Latency", sortOrder = 1)
+
+        val result = UpdateDashboardWidgetTool().execute(
+            JsonObject(
+                mapOf(
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "widget_id" to JsonPrimitive(widgetResourceId(firstWidgetId)),
+                    "title" to JsonPrimitive("CPU load"),
+                    "widget_type" to JsonPrimitive("gauge"),
+                    "grid_w" to JsonPrimitive(3),
+                    "query_configs" to JsonArray(listOf(queryDslJson("spans"))),
+                )
+            ),
+            context
+        )
+
+        val dashboard = decodeDashboard(result.content.first().text!!)
+        val updated = dashboard.widgets.single { it.id == widgetResourceId(firstWidgetId) }
+        val untouched = dashboard.widgets.single { it.id == widgetResourceId(secondWidgetId) }
+        assertFalse(result.isError)
+        assertEquals("CPU load", updated.title)
+        assertEquals("gauge", updated.widgetType)
+        assertEquals(3, updated.gridW)
+        assertEquals("spans", updated.queryConfigs.single().dataSource)
+        assertEquals("Latency", untouched.title)
+        assertEquals("timeseries", untouched.widgetType)
+    }
+
+    @Test
+    fun `delete dashboard widget removes only the target widget`() = runBlocking {
+        val dashboardId = seedDashboard()
+        val firstWidgetId = seedWidget(dashboardId, title = "CPU")
+        val secondWidgetId = seedWidget(dashboardId, widgetId = WIDGET_ID + 1, title = "Latency", sortOrder = 1)
+
+        val result = DeleteDashboardWidgetTool().execute(
+            JsonObject(
+                mapOf(
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "widget_id" to JsonPrimitive(widgetResourceId(firstWidgetId)),
+                )
+            ),
+            context
+        )
+
+        val dashboard = decodeDashboard(result.content.first().text!!)
+        assertFalse(result.isError)
+        assertEquals(listOf(widgetResourceId(secondWidgetId)), dashboard.widgets.map { it.id })
+        assertEquals("Latency", dashboard.widgets.single().title)
+    }
+
+    @Test
+    fun `replace dashboard widgets rejects stale expected widget count`() = runBlocking {
+        val dashboardId = seedDashboard()
+        seedWidget(dashboardId)
+
+        val result = ReplaceDashboardWidgetsTool().execute(
+            JsonObject(
+                mapOf(
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "expected_widget_count" to JsonPrimitive(2),
+                    "widgets" to JsonArray(emptyList()),
+                )
+            ),
+            context
+        )
+
+        assertTrue(result.isError)
+        assertEquals(
+            "Dashboard has 1 widgets but expected_widget_count is 2. " +
+                "Read the dashboard first to get current state.",
+            result.content.first().text,
+        )
+    }
+
+    @Test
+    fun `replace dashboard widgets swaps all widgets when expected count matches`() = runBlocking {
+        val dashboardId = seedDashboard()
+        seedWidget(dashboardId, title = "CPU")
+
+        val result = ReplaceDashboardWidgetsTool().execute(
+            JsonObject(
+                mapOf(
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "expected_widget_count" to JsonPrimitive(1),
+                    "widgets" to JsonArray(
+                        listOf(
+                            JsonObject(
+                                mapOf(
+                                    "title" to JsonPrimitive("Requests"),
+                                    "widget_type" to JsonPrimitive("bar"),
+                                    "grid_x" to JsonPrimitive(1),
+                                    "grid_y" to JsonPrimitive(2),
+                                    "grid_w" to JsonPrimitive(8),
+                                    "grid_h" to JsonPrimitive(3),
+                                    "query_configs" to JsonArray(listOf(queryDslJson("logs"))),
+                                    "display_config" to JsonObject(mapOf("unit" to JsonPrimitive("count"))),
+                                    "sort_order" to JsonPrimitive(7),
+                                )
+                            )
+                        )
+                    ),
+                )
+            ),
+            context
+        )
+
+        val dashboard = decodeDashboard(result.content.first().text!!)
+        val replacement = dashboard.widgets.single()
+        assertFalse(result.isError)
+        assertEquals("Requests", replacement.title)
+        assertEquals("bar", replacement.widgetType)
+        assertEquals(2, replacement.gridY)
+        assertEquals(8, replacement.gridW)
+        assertEquals(7, replacement.sortOrder)
+        assertEquals("logs", replacement.queryConfigs.single().dataSource)
+        assertEquals("count", replacement.displayConfig["unit"])
+    }
+
+    @Test
+    fun `preview dashboard widget query rejects mismatched project scope`() = runBlocking {
+        val dashboardId = seedDashboard()
+
+        val result = PreviewDashboardWidgetQueryTool().execute(
+            JsonObject(
+                mapOf(
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "project_id" to JsonPrimitive(SECOND_PROJECT_RESOURCE_ID),
+                    "query_config" to queryDslJson("metrics"),
+                )
+            ),
+            context
+        )
+
+        assertTrue(result.isError)
+        assertEquals("Dashboard is scoped to project $PROJECT_RESOURCE_ID", result.content.first().text)
+    }
+
+    @Test
+    fun `preview dashboard widget query schema accepts resource IDs only`() {
+        val projectIdSchema = PreviewDashboardWidgetQueryTool()
+            .inputSchema
+            .properties["project_id"]!!
+            .jsonObject
+
+        assertEquals("string", projectIdSchema["type"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun `preview dashboard widget query requires project id for unscoped dashboards`() = runBlocking {
+        val dashboardId = seedDashboard(projectId = null)
+
+        val result = PreviewDashboardWidgetQueryTool().execute(
+            JsonObject(
+                mapOf(
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "query_config" to queryDslJson("metrics"),
+                )
+            ),
+            context
+        )
+
+        assertTrue(result.isError)
+        assertEquals("project_id is required when dashboard is not scoped to a project", result.content.first().text)
+    }
+
+    @Test
+    fun `preview dashboard widget query validates custom data source id after substitutions`() = runBlocking {
+        val dashboardId = seedDashboard()
+
+        val result = PreviewDashboardWidgetQueryTool().execute(
+            JsonObject(
+                mapOf(
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "query_config" to queryDslJson("custom:bad", rawQuery = "up{service=\"\$service\"}"),
+                    "variables" to JsonObject(mapOf("service" to JsonPrimitive("api"))),
+                    "time_range" to JsonObject(
+                        mapOf(
+                            "from" to JsonPrimitive("now-1h"),
+                            "to" to JsonPrimitive("now"),
+                        )
+                    ),
+                )
+            ),
+            context
+        )
+
+        assertTrue(result.isError)
+        assertEquals("Invalid custom data source ID", result.content.first().text)
+    }
+
+    @Test
+    fun `preview dashboard widget query reports missing custom data source`() = runBlocking {
+        val dashboardId = seedDashboard()
+
+        val result = PreviewDashboardWidgetQueryTool().execute(
+            JsonObject(
+                mapOf(
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "query_config" to queryDslJson("custom:$MISSING_DATA_SOURCE_RESOURCE_ID", rawQuery = "up"),
+                )
+            ),
+            context
+        )
+
+        assertTrue(result.isError)
+        assertEquals("Data source not found", result.content.first().text)
+    }
+
+    @Test
+    fun `preview dashboard widget query resolves prometheus alias`() = runBlocking {
+        val dashboardId = seedDashboard()
+        seedCustomDataSource(sourceType = "prometheus")
+
+        val result = PreviewDashboardWidgetQueryTool().execute(
+            JsonObject(
+                mapOf(
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "query_config" to queryDslJson("__prometheus", rawQuery = "up"),
+                )
+            ),
+            context
+        )
+
+        assertTrue(result.isError)
+        assertEquals("Failed to decrypt credentials", result.content.first().text)
+    }
+
+    @Test
+    fun `preview dashboard widget query ignores disabled prometheus alias target`() = runBlocking {
+        val dashboardId = seedDashboard()
+        seedCustomDataSource(sourceType = "prometheus", enabled = false)
+
+        val result = PreviewDashboardWidgetQueryTool().execute(
+            JsonObject(
+                mapOf(
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "query_config" to queryDslJson("__prometheus", rawQuery = "up"),
+                )
+            ),
+            context
+        )
+
+        assertFalse(result.isError)
+        assertEquals("[]", result.content.first().text)
+    }
+
+    @Test
+    fun `preview dashboard widget query skips built in raw query execution`() = runBlocking {
+        val dashboardId = seedDashboard()
+
+        val result = PreviewDashboardWidgetQueryTool().execute(
+            JsonObject(
+                mapOf(
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "query_config" to queryDslJson("metrics", rawQuery = "SELECT 1"),
+                )
+            ),
+            context
+        )
+
+        assertFalse(result.isError)
+        assertEquals("[]", result.content.first().text)
+    }
+
+    @Test
+    fun `dashboard widget tools report missing dashboards and widgets`() = runBlocking {
+        val dashboardId = seedDashboard()
+
+        assertToolError(
+            UpdateDashboardWidgetTool(),
+            JsonObject(
+                mapOf(
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "widget_id" to JsonPrimitive(widgetResourceId(WIDGET_ID)),
+                    "title" to JsonPrimitive("CPU"),
+                )
+            ),
+            "Widget not found on dashboard: ${widgetResourceId(WIDGET_ID)}"
+        )
+        assertToolError(
+            DeleteDashboardWidgetTool(),
+            JsonObject(
+                mapOf(
+                    "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                    "widget_id" to JsonPrimitive(widgetResourceId(WIDGET_ID)),
+                )
+            ),
+            "Widget not found on dashboard: ${widgetResourceId(WIDGET_ID)}"
+        )
+        assertToolError(
+            ReplaceDashboardWidgetsTool(),
+            JsonObject(
+                mapOf(
+                    "dashboard_id" to JsonPrimitive(MISSING_DASHBOARD_RESOURCE_ID),
+                    "expected_widget_count" to JsonPrimitive(0),
+                    "widgets" to JsonArray(emptyList()),
+                )
+            ),
+            "Dashboard not found: $MISSING_DASHBOARD_RESOURCE_ID"
+        )
+        assertToolError(
+            PreviewDashboardWidgetQueryTool(),
+            JsonObject(
+                mapOf(
+                    "dashboard_id" to JsonPrimitive(MISSING_DASHBOARD_RESOURCE_ID),
+                    "query_config" to queryDslJson("metrics"),
+                )
+            ),
+            "Dashboard not found: $MISSING_DASHBOARD_RESOURCE_ID"
+        )
+    }
+
+    @Test
+    fun `dashboard widget tools reject malformed argument types`() = runBlocking {
+        val dashboardId = seedDashboard()
+        seedWidget(dashboardId)
+
+        val baseCreateArgs = mapOf(
+            "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+            "widget_type" to JsonPrimitive("stat"),
+        )
+
+        val cases = listOf(
+            ToolCase(
+                CreateDashboardWidgetTool(),
+                JsonObject(baseCreateArgs + ("grid_x" to JsonObject(emptyMap()))),
+                "grid_x must be a valid integer",
+            ),
+            ToolCase(
+                CreateDashboardWidgetTool(),
+                JsonObject(baseCreateArgs + ("title" to JsonObject(emptyMap()))),
+                "title must be a string",
+            ),
+            ToolCase(
+                CreateDashboardWidgetTool(),
+                JsonObject(baseCreateArgs + ("title" to JsonPrimitive(123))),
+                "title must be a string",
+            ),
+            ToolCase(
+                CreateDashboardWidgetTool(),
+                JsonObject(baseCreateArgs + ("query_configs" to JsonObject(emptyMap()))),
+                "query_configs must be an array",
+            ),
+            ToolCase(
+                CreateDashboardWidgetTool(),
+                JsonObject(baseCreateArgs + ("display_config" to JsonArray(emptyList()))),
+                "display_config must be an object",
+            ),
+            ToolCase(
+                PreviewDashboardWidgetQueryTool(),
+                JsonObject(
+                    mapOf(
+                        "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                        "query_config" to JsonObject(emptyMap()),
+                    )
+                ),
+                "Invalid query_config:",
+            ),
+            ToolCase(
+                PreviewDashboardWidgetQueryTool(),
+                JsonObject(
+                    mapOf(
+                        "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                        "query_config" to queryDslJson("metrics"),
+                        "variables" to JsonArray(emptyList()),
+                    )
+                ),
+                "variables must be an object",
+            ),
+            ToolCase(
+                PreviewDashboardWidgetQueryTool(),
+                JsonObject(
+                    mapOf(
+                        "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                        "query_config" to queryDslJson("metrics"),
+                        "variables" to JsonObject(mapOf("service" to JsonObject(emptyMap()))),
+                    )
+                ),
+                "variables.service must be a string",
+            ),
+            ToolCase(
+                PreviewDashboardWidgetQueryTool(),
+                JsonObject(
+                    mapOf(
+                        "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                        "query_config" to queryDslJson("metrics"),
+                        "variables" to JsonObject(mapOf("service" to JsonPrimitive(123))),
+                    )
+                ),
+                "variables.service must be a string",
+            ),
+            ToolCase(
+                PreviewDashboardWidgetQueryTool(),
+                JsonObject(
+                    mapOf(
+                        "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                        "query_config" to queryDslJson("metrics"),
+                        "time_range" to JsonArray(emptyList()),
+                    )
+                ),
+                "time_range must be an object",
+            ),
+            ToolCase(
+                ReplaceDashboardWidgetsTool(),
+                JsonObject(
+                    mapOf(
+                        "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                        "expected_widget_count" to JsonPrimitive(1),
+                        "widgets" to JsonObject(emptyMap()),
+                    )
+                ),
+                "widgets must be an array",
+            ),
+            ToolCase(
+                ReplaceDashboardWidgetsTool(),
+                JsonObject(
+                    mapOf(
+                        "dashboard_id" to JsonPrimitive(dashboardResourceId(dashboardId)),
+                        "expected_widget_count" to JsonPrimitive(1),
+                        "widgets" to JsonArray(
+                            listOf(JsonObject(mapOf("widget_type" to JsonPrimitive("bad"))))
+                        ),
+                    )
+                ),
+                "Unknown widget_type: bad",
+            ),
+        )
+
+        cases.forEach { case ->
+            assertToolError(case.tool, case.args, case.expectedMessage)
+        }
+    }
+
     // ──── Helpers ────
 
-    private fun seedDashboard(): Long = transaction {
+    private data class ToolCase(
+        val tool: McpTool,
+        val args: JsonObject,
+        val expectedMessage: String,
+    )
+
+    private suspend fun assertToolError(tool: McpTool, args: JsonObject, expectedMessage: String) {
+        val result = tool.execute(args, context)
+
+        assertTrue(result.isError)
+        assertTrue(
+            result.content.first().text!!.startsWith(expectedMessage),
+            "Expected '${result.content.first().text}' to start with '$expectedMessage'",
+        )
+    }
+
+    private fun seedDashboard(projectId: Long? = PROJECT_ID): Long = transaction {
+        val projectValue = projectId?.toString() ?: "NULL"
         exec(
             """
             INSERT INTO dashboards (
-                id, org_id, project_id, title, created_by, created_at, updated_at
+                id, resource_id, org_id, project_id, title, created_by, created_at, updated_at
             ) VALUES (
-                $DASHBOARD_ID, $ORG_ID, $PROJECT_ID, 'MCP Test Dashboard',
+                $DASHBOARD_ID, '$DASHBOARD_RESOURCE_ID', $ORG_ID, $projectValue, 'MCP Test Dashboard',
                 $CREATED_BY, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
             )
             """.trimIndent()
@@ -376,23 +1040,73 @@ class DashboardCrudToolTest {
         DASHBOARD_ID
     }
 
-    private fun seedWidget(dashboardId: Long): Long = transaction {
+    private fun seedWidget(
+        dashboardId: Long,
+        widgetId: Long = WIDGET_ID,
+        title: String = "Test Widget",
+        widgetType: String = "timeseries",
+        gridY: Int = 0,
+        gridH: Int = 4,
+        sortOrder: Int = 0,
+    ): Long = transaction {
         exec(
             """
             INSERT INTO dashboard_widgets (
-                id, dashboard_id, title, widget_type, query_config, query_configs, display_config,
-                created_at, updated_at
+                id, resource_id, dashboard_id, title, widget_type, query_config, query_configs, display_config,
+                grid_y, grid_h, sort_order, created_at, updated_at
             ) VALUES (
-                $WIDGET_ID, $dashboardId, 'Test Widget', 'timeseries', '{}', '[]', '{}',
+                $widgetId, '${widgetResourceId(widgetId)}', $dashboardId, '$title', '$widgetType', '{}', '[]', '{}',
+                $gridY, $gridH, $sortOrder,
                 CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
             )
             """.trimIndent()
         )
-        WIDGET_ID
+        widgetId
     }
+
+    private fun seedCustomDataSource(
+        sourceId: Long = DATA_SOURCE_ID,
+        sourceType: String,
+        enabled: Boolean = true,
+    ): Long = transaction {
+        val enabledValue = if (enabled) "TRUE" else "FALSE"
+        exec(
+            """
+            INSERT INTO custom_data_sources (
+                id, resource_id, org_id, name, source_type, host, encrypted_credentials, extra_config,
+                enabled, created_by, created_at, updated_at
+            ) VALUES (
+                $sourceId, '$DATA_SOURCE_RESOURCE_ID', $ORG_ID, 'Prometheus', '$sourceType', 'prometheus.local',
+                'not-encrypted', '{}', $enabledValue, $CREATED_BY, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+            """.trimIndent()
+        )
+        sourceId
+    }
+
+    private fun dashboardResourceId(dashboardId: Long): String =
+        if (dashboardId == DASHBOARD_ID) DASHBOARD_RESOURCE_ID else MISSING_DASHBOARD_RESOURCE_ID
+
+    private fun widgetResourceId(widgetId: Long): String =
+        when (widgetId) {
+            WIDGET_ID -> WIDGET_RESOURCE_ID
+            WIDGET_ID + 1 -> SECOND_WIDGET_RESOURCE_ID
+            else -> MISSING_WIDGET_RESOURCE_ID
+        }
 
     private fun decodeAlert(text: String): DashboardAlertResponse =
         json.decodeFromString<DashboardAlertResponse>(text)
+
+    private fun decodeDashboard(text: String): DashboardResponse =
+        json.decodeFromString<DashboardResponse>(text)
+
+    private fun queryDslJson(dataSource: String, rawQuery: String? = null): JsonObject {
+        val fields = mutableMapOf<String, JsonElement>("dataSource" to JsonPrimitive(dataSource))
+        if (rawQuery != null) {
+            fields["rawQuery"] = JsonPrimitive(rawQuery)
+        }
+        return JsonObject(fields)
+    }
 
     private fun enumValues(properties: JsonObject, property: String): List<String> {
         val values = properties[property]!!.jsonObject["enum"] as JsonArray
@@ -427,8 +1141,20 @@ class DashboardCrudToolTest {
         private const val ORG_ID = 1L
         private const val CREATED_BY = 100L
         private const val PROJECT_ID = 200L
+        private const val SECOND_PROJECT_ID = PROJECT_ID + 1
+        private const val PROJECT_RESOURCE_ID = "018f4ce4-3f2a-7a67-a32b-0c1848f62b9d"
+        private const val SECOND_PROJECT_RESOURCE_ID = "118f4ce4-3f2a-7a67-a32b-0c1848f62b9d"
         private const val DASHBOARD_ID = 10L
+        private const val DASHBOARD_RESOURCE_ID = "218f4ce4-3f2a-7a67-a32b-0c1848f62b9d"
+        private const val MISSING_DASHBOARD_RESOURCE_ID = "318f4ce4-3f2a-7a67-a32b-0c1848f62b9d"
         private const val WIDGET_ID = 20L
+        private const val WIDGET_RESOURCE_ID = "418f4ce4-3f2a-7a67-a32b-0c1848f62b9d"
+        private const val SECOND_WIDGET_RESOURCE_ID = "518f4ce4-3f2a-7a67-a32b-0c1848f62b9d"
+        private const val MISSING_WIDGET_RESOURCE_ID = "618f4ce4-3f2a-7a67-a32b-0c1848f62b9d"
+        private const val DATA_SOURCE_ID = 30L
+        private const val DATA_SOURCE_RESOURCE_ID = "718f4ce4-3f2a-7a67-a32b-0c1848f62b9d"
+        private const val MISSING_DATA_SOURCE_RESOURCE_ID = "818f4ce4-3f2a-7a67-a32b-0c1848f62b9d"
+        private const val MISSING_ALERT_RESOURCE_ID = "918f4ce4-3f2a-7a67-a32b-0c1848f62b9d"
         private const val DASHBOARD_JSONB_TYPE = "com.moneat.dashboards.models.JsonbColumnType"
     }
 }

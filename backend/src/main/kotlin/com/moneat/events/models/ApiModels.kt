@@ -17,6 +17,7 @@
 package com.moneat.events.models
 
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.Transient
 import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 
@@ -58,7 +59,8 @@ data class UserResponse(
     val demoEpochMs: Long? = null,
     val sidebarHiddenItems: List<String> = emptyList(),
     val phoneNumber: String? = null,
-    val timezone: String? = null
+    val timezone: String? = null,
+    val orgId: Int? = null
 )
 
 @Serializable
@@ -69,19 +71,21 @@ data class ProjectKeyResponse(
 
 @Serializable
 data class ProjectResponse(
-    val id: Long,
+    val id: String,
     val name: String,
     val slug: String,
     val framework: String?,
     val keys: List<ProjectKeyResponse>,
     val dsn: String, // First key's DSN for backward compatibility
-    val issueCount: Long = 0
+    val issueCount: Long = 0,
+    val serviceId: String = id,
+    val serviceName: String = slug
 )
 
 @Serializable
 data class IssueResponse(
     val id: String,
-    val projectId: Long,
+    val projectId: String,
     val title: String,
     val culprit: String,
     val level: String,
@@ -98,7 +102,7 @@ data class IssueResponse(
 @Serializable
 data class IssueDetailResponse(
     val id: String,
-    val projectId: Long,
+    val projectId: String,
     val projectName: String,
     val title: String,
     val culprit: String,
@@ -231,7 +235,7 @@ data class TransactionWithSpansResponse(
 @Serializable
 data class TraceDetailResponse(
     val traceId: String,
-    val projectId: Long,
+    val projectId: String,
     val spans: List<SpanResponse>,
     val startTimestamp: Double,
     val endTimestamp: Double,
@@ -242,7 +246,7 @@ data class TraceDetailResponse(
 data class EventTraceResponse(
     val eventId: String?,
     val eventType: String?,
-    val projectId: Long,
+    val projectId: String,
     val traceId: String,
     val transaction: TransactionDetailResponse? = null,
     val spans: List<SpanResponse> = emptyList()
@@ -454,7 +458,7 @@ data class ReleaseMarker(
 @Serializable
 data class ReplayListItem(
     val replayId: String,
-    val projectId: Long,
+    val projectId: String,
     val startedAt: String,
     val finishedAt: String,
     val durationMs: Double,
@@ -465,13 +469,16 @@ data class ReplayListItem(
     val browserVersion: String?,
     val osName: String?,
     val osVersion: String?,
-    val activity: Int
+    val activity: Int,
+    val signals: List<String> = emptyList(),
+    val entryUrl: String? = null
 )
 
 @Serializable
 data class ReplayDetailResponse(
     val replayId: String,
-    val projectId: Long,
+    val projectId: String,
+    @Transient val numericProjectId: Long = 0,
     val startedAt: String,
     val finishedAt: String,
     val durationMs: Double,
@@ -489,7 +496,14 @@ data class ReplayDetailResponse(
     val osName: String?,
     val osVersion: String?,
     val activity: Int,
-    val tags: Map<String, String>
+    val tags: Map<String, String>,
+    val signals: List<String> = emptyList(),
+    val entryUrl: String? = null,
+    val ipAddress: String? = null,
+    val geo: String? = null,
+    val viewport: String? = null,
+    val connection: String? = null,
+    val userSessionCount: Int? = null
 )
 
 @Serializable
@@ -509,7 +523,9 @@ data class ReplayTimelineItem(
     val category: String? = null,
     val eventId: String? = null,
     val issueId: String? = null,
-    val traceId: String? = null
+    val traceId: String? = null,
+    val statusCode: Int? = null,
+    val rage: Boolean? = null
 )
 
 @Serializable
@@ -532,7 +548,13 @@ data class FeedbackListItem(
     val platform: String,
     val user: UserInfo?,
     val associatedEventId: String?,
-    val replayId: String?
+    val replayId: String?,
+    val sourceType: String = "sentry",
+    val sourceName: String = "Sentry-compatible SDK",
+    val sourceEventName: String = "feedback",
+    val traceId: String = "",
+    val spanId: String = "",
+    val resourceAttributes: Map<String, String> = emptyMap()
 )
 
 @Serializable
@@ -552,12 +574,24 @@ data class FeedbackDetailResponse(
     val replayId: String?,
     val tags: Map<String, String>,
     val sdkName: String,
-    val sdkVersion: String
+    val sdkVersion: String,
+    val sourceType: String = "sentry",
+    val sourceName: String = "Sentry-compatible SDK",
+    val sourceEventName: String = "feedback",
+    val traceId: String = "",
+    val spanId: String = "",
+    val resourceAttributes: Map<String, String> = emptyMap()
 )
 
 @Serializable
 data class FeedbackUpdateRequest(
     val status: String? = null
+)
+
+@Serializable
+data class EventIssueLinkResponse(
+    val issueId: String,
+    val projectId: String
 )
 
 @Serializable
@@ -606,7 +640,7 @@ data class NotificationPreferencesData(
 
 @Serializable
 data class ProjectNotificationPreferences(
-    val projectId: Long,
+    val projectId: String,
     val projectName: String,
     val issueAlerts: Boolean,
     val errorAlerts: Boolean,

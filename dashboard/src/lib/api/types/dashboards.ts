@@ -23,6 +23,10 @@ export interface DashboardVariable {
   current?: string | null
   options: string[]
   datasource?: string | null
+  /** Accepts several values at once; the selected value is stored comma-joined. */
+  multi?: boolean
+  /** Offers an "All" choice (selected value `$__all`). */
+  include_all?: boolean
 }
 
 export interface MetricDef {
@@ -67,8 +71,8 @@ export interface QueryDsl {
 }
 
 export interface DashboardWidget {
-  id: number
-  dashboard_id: number
+  id: string
+  dashboard_id: string
   title?: string | null
   widget_type: string
   grid_x: number
@@ -88,20 +92,20 @@ export interface DashboardWidgetAlertNotificationChannels {
 
 export type DashboardAlertCondition = '>' | '<' | '>=' | '<=' | '=='
 
-export type AlertSeverity = 'CRITICAL' | 'HIGH' | 'MEDIUM' | 'LOW' | null
+export type AlertPriority = 'P0' | 'P1' | 'P2' | 'P3' | 'P4' | 'P5' | null
 export type DashboardAlertLevel = 'WARNING' | 'ERROR' | null
 
 export interface DashboardWidgetAlert {
-  id: number
-  widget_id: number
-  dashboard_id: number
+  id: string
+  widget_id: string
+  dashboard_id: string
   name: string
   condition: DashboardAlertCondition
   threshold: number
   warning_threshold: number | null
   metric_index: number
   duration_seconds: number
-  incident_severity: AlertSeverity
+  alert_priority: AlertPriority
   enabled: boolean
   notification_channels: DashboardWidgetAlertNotificationChannels
   last_triggered_at: string | null
@@ -112,14 +116,14 @@ export interface DashboardWidgetAlert {
 }
 
 export interface CreateDashboardAlertRequest {
-  widget_id: number
+  widget_id: string
   name: string
   condition: DashboardAlertCondition
   threshold: number
   warning_threshold?: number | null
   metric_index?: number
   duration_seconds?: number
-  incident_severity?: AlertSeverity
+  alert_priority?: AlertPriority
   enabled?: boolean
   notification_channels?: DashboardWidgetAlertNotificationChannels
 }
@@ -131,20 +135,26 @@ export interface UpdateDashboardAlertRequest {
   warning_threshold?: number | null
   metric_index?: number
   duration_seconds?: number
-  incident_severity?: AlertSeverity
+  alert_priority?: AlertPriority
   enabled?: boolean
   notification_channels?: DashboardWidgetAlertNotificationChannels
 }
 
 export interface BatchQueryResult {
   results: Record<string, Record<string, unknown>[]>
+  metadata?: Record<string, BatchQueryResultMetadata>
+}
+
+export interface BatchQueryResultMetadata {
+  original_ref_id?: string | null
+  query_index: number
 }
 
 export interface CustomDashboard {
-  id: number
+  id: string
   org_id: number
-  project_id?: number | null
-  folder_id?: number | null
+  project_id?: string | null
+  folder_id?: string | null
   title: string
   description?: string | null
   layout_type: string
@@ -158,7 +168,7 @@ export interface CustomDashboard {
 }
 
 export interface DashboardFolder {
-  id: number
+  id: string
   org_id: number
   name: string
   color?: string | null
@@ -168,7 +178,7 @@ export interface DashboardFolder {
 }
 
 export interface CreateWidgetRequest {
-  id?: number
+  id?: string
   title?: string | null
   widget_type: string
   grid_x: number
@@ -183,8 +193,8 @@ export interface CreateWidgetRequest {
 export interface CreateDashboardRequest {
   title: string
   description?: string | null
-  project_id?: number | null
-  folder_id?: number | null
+  project_id?: string | null
+  folder_id?: string | null
   layout_type?: string
   is_default?: boolean
   variables?: DashboardVariable[]
@@ -206,7 +216,7 @@ export interface UpdateFolderRequest {
 export interface UpdateDashboardRequest {
   title?: string | null
   description?: string | null
-  folder_id?: number | null
+  folder_id?: string | null
   layout_type?: string | null
   is_default?: boolean | null
   variables?: DashboardVariable[] | null
@@ -219,7 +229,7 @@ export interface SearchResponse {
 }
 
 export interface SearchProjectResponse {
-  id: number
+  id: string
   name: string
 }
 
@@ -235,6 +245,28 @@ export interface DashboardImportResult {
   variables?: DashboardVariable[]
 }
 
+export interface DashboardTemplateSummary {
+  id: string
+  title: string
+  description?: string | null
+  category: string
+  tags: string[]
+  required_sources: string[]
+  widget_count: number
+  variable_count: number
+  resource_path: string
+}
+
+export interface DashboardTemplateDetail extends Omit<DashboardTemplateSummary, 'resource_path'> {
+  warnings: string[]
+  dashboard: CreateDashboardRequest
+}
+
+export interface InstantiateDashboardTemplateRequest {
+  project_id?: string | null
+  folder_id?: string | null
+}
+
 export interface DataSourceField {
   name: string
   type: string
@@ -248,7 +280,7 @@ export interface DataSourceInfo {
 }
 
 export interface CustomDataSourceResponse {
-  id: number
+  id: string
   org_id: number
   name: string
   description?: string
@@ -331,7 +363,7 @@ export interface TestConnectionResult {
 }
 
 export interface CustomDataSourceQueryRequest {
-  data_source_id: number
+  data_source_id: string
   query: string
   limit?: number
   time_range?: TimeRangeDef

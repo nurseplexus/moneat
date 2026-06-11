@@ -25,6 +25,7 @@ import com.moneat.shared.models.Projects
 import com.moneat.shared.models.Subscriptions
 import com.moneat.shared.models.Users
 import com.moneat.testsupport.RouteTestSupport
+import com.moneat.testsupport.RouteTestSupport.installApiRouteRateLimits
 import com.moneat.testsupport.RouteTestSupport.installJwtAuth
 import com.moneat.testsupport.RouteTestSupport.withAuth
 import com.moneat.testsupport.TestDatabaseHelper
@@ -39,13 +40,12 @@ import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
-import io.ktor.server.application.install
-import io.ktor.server.plugins.ratelimit.RateLimit
-import io.ktor.server.plugins.ratelimit.RateLimitName
 import io.ktor.server.routing.routing
 import io.ktor.server.testing.testApplication
+import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
 import kotlin.test.AfterTest
@@ -53,7 +53,6 @@ import kotlin.test.BeforeTest
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertTrue
-import kotlin.time.Duration.Companion.seconds
 
 /**
  * Exercises authenticated `/v1` API routes (JWT + rate limit) beyond [ApiRoutesTest].
@@ -92,17 +91,33 @@ class ApiRoutesExtendedTest {
         stopTestKoin()
     }
 
+    private fun seedProjectResourceId(): String {
+        val projectId = transaction {
+            val orgId = Organizations.insert {
+                it[name] = "Forbidden Org"
+                it[slug] = "forbidden-org-${System.nanoTime()}"
+            } get Organizations.id
+            Projects.insert {
+                it[organization_id] = orgId
+                it[name] = "Forbidden Project"
+                it[slug] = "forbidden-project-${System.nanoTime()}"
+            } get Projects.id
+        }
+        return transaction {
+            Projects
+                .selectAll()
+                .where { Projects.id eq projectId }
+                .first()[Projects.resource_id]
+                .toString()
+        }
+    }
+
     @Test
     fun `GET user returns 401 without auth`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         val response = client.get("/v1/user")
         assertEquals(HttpStatusCode.Unauthorized, response.status)
@@ -112,13 +127,8 @@ class ApiRoutesExtendedTest {
     fun `GET user requires valid token`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         val token = RouteTestSupport.createToken(userId = 1)
         val response = client.get("/v1/user") { withAuth(token) }
@@ -162,13 +172,8 @@ class ApiRoutesExtendedTest {
 
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
 
         val token = RouteTestSupport.createToken(userId = userId, orgId = otherOrgId)
@@ -190,13 +195,8 @@ class ApiRoutesExtendedTest {
 
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
 
         val token = RouteTestSupport.createToken(userId = userId)
@@ -230,13 +230,8 @@ class ApiRoutesExtendedTest {
 
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
 
         val token = RouteTestSupport.createToken(userId = userId, orgId = orgId)
@@ -250,13 +245,8 @@ class ApiRoutesExtendedTest {
     fun `PUT user phone-number requires auth`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         val unauth = client.put("/v1/user/phone-number") {
             contentType(ContentType.Application.Json)
@@ -269,13 +259,8 @@ class ApiRoutesExtendedTest {
     fun `PUT user phone-number with auth hits validation or handler`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         val token = RouteTestSupport.createToken(userId = 1)
         val response =
@@ -293,13 +278,8 @@ class ApiRoutesExtendedTest {
     fun `GET user sidebar-preferences is PUT-only returns 405 with auth`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         val token = RouteTestSupport.createToken(userId = 1)
         val response = client.get("/v1/user/sidebar-preferences") { withAuth(token) }
@@ -310,13 +290,8 @@ class ApiRoutesExtendedTest {
     fun `PUT user sidebar-preferences requires auth`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         val response =
             client.put("/v1/user/sidebar-preferences") {
@@ -327,16 +302,52 @@ class ApiRoutesExtendedTest {
     }
 
     @Test
+    fun `PUT user sidebar-preferences uses JWT org membership`() = testApplication {
+        val (userId, orgId) =
+            transaction {
+                val insertedUserId =
+                    Users.insert {
+                        it[email] = "sidebar-scope@test.com"
+                        it[password_hash] = "hash"
+                        it[email_verified] = true
+                    } get Users.id
+                val insertedOrgId =
+                    Organizations.insert {
+                        it[name] = "Sidebar Org"
+                        it[slug] = "sidebar-org"
+                    } get Organizations.id
+                Memberships.insert {
+                    it[user_id] = insertedUserId
+                    it[organization_id] = insertedOrgId
+                    it[role] = "owner"
+                }
+                insertedUserId to insertedOrgId
+            }
+
+        application {
+            installJwtAuth()
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
+        }
+
+        val token = RouteTestSupport.createToken(userId = userId, orgId = orgId)
+        val response =
+            client.put("/v1/user/sidebar-preferences") {
+                withAuth(token)
+                contentType(ContentType.Application.Json)
+                setBody("""{"hiddenItems":[]}""")
+            }
+
+        assertEquals(HttpStatusCode.OK, response.status)
+        assertTrue(response.bodyAsText().contains("hiddenItems"))
+    }
+
+    @Test
     fun `GET projects requires auth`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         assertEquals(HttpStatusCode.Unauthorized, client.get("/v1/projects").status)
     }
@@ -345,13 +356,8 @@ class ApiRoutesExtendedTest {
     fun `GET projects with auth is routed`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         val token = RouteTestSupport.createToken(userId = 1)
         val response = client.get("/v1/projects") { withAuth(token) }
@@ -361,33 +367,23 @@ class ApiRoutesExtendedTest {
     }
 
     @Test
-    fun `GET project by id returns forbidden for unknown project`() = testApplication {
+    fun `GET project by id rejects numeric project IDs`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         val token = RouteTestSupport.createToken(userId = 1)
         val response = client.get("/v1/projects/424242") { withAuth(token) }
-        assertEquals(HttpStatusCode.Forbidden, response.status)
+        assertEquals(HttpStatusCode.BadRequest, response.status)
     }
 
     @Test
     fun `POST projects requires auth`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         val response =
             client.post("/v1/projects") {
@@ -401,16 +397,12 @@ class ApiRoutesExtendedTest {
     fun `GET project issues returns 403 for non-member`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         val token = RouteTestSupport.createToken(userId = 42)
-        val response = client.get("/v1/projects/7/issues") { withAuth(token) }
+        val resourceId = seedProjectResourceId()
+        val response = client.get("/v1/projects/$resourceId/issues") { withAuth(token) }
         assertEquals(HttpStatusCode.Forbidden, response.status)
     }
 
@@ -418,13 +410,8 @@ class ApiRoutesExtendedTest {
     fun `GET issue events with projectId requires auth`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         val token = RouteTestSupport.createToken(userId = 1)
         val response =
@@ -440,13 +427,8 @@ class ApiRoutesExtendedTest {
     fun `GET project transactions requires auth`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         assertEquals(
             HttpStatusCode.Unauthorized,
@@ -458,16 +440,12 @@ class ApiRoutesExtendedTest {
     fun `GET project transactions with auth returns forbidden without access`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         val token = RouteTestSupport.createToken(userId = 3)
-        val response = client.get("/v1/projects/9/transactions") { withAuth(token) }
+        val resourceId = seedProjectResourceId()
+        val response = client.get("/v1/projects/$resourceId/transactions") { withAuth(token) }
         assertEquals(HttpStatusCode.Forbidden, response.status)
     }
 
@@ -475,16 +453,12 @@ class ApiRoutesExtendedTest {
     fun `GET project stats returns forbidden without access`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         val token = RouteTestSupport.createToken(userId = 1)
-        val response = client.get("/v1/projects/2/stats") { withAuth(token) }
+        val resourceId = seedProjectResourceId()
+        val response = client.get("/v1/projects/$resourceId/stats") { withAuth(token) }
         assertEquals(HttpStatusCode.Forbidden, response.status)
     }
 
@@ -492,16 +466,12 @@ class ApiRoutesExtendedTest {
     fun `GET project trace returns forbidden without access`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         val token = RouteTestSupport.createToken(userId = 50)
-        val response = client.get("/v1/projects/88/traces/trace-abc") { withAuth(token) }
+        val resourceId = seedProjectResourceId()
+        val response = client.get("/v1/projects/$resourceId/traces/trace-abc") { withAuth(token) }
         assertEquals(HttpStatusCode.Forbidden, response.status)
     }
 
@@ -509,13 +479,8 @@ class ApiRoutesExtendedTest {
     fun `GET project replays requires auth`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         assertEquals(
             HttpStatusCode.Unauthorized,
@@ -527,16 +492,12 @@ class ApiRoutesExtendedTest {
     fun `GET project releases forbidden without access`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         val token = RouteTestSupport.createToken(userId = 2)
-        val response = client.get("/v1/projects/3/releases") { withAuth(token) }
+        val resourceId = seedProjectResourceId()
+        val response = client.get("/v1/projects/$resourceId/releases") { withAuth(token) }
         assertEquals(HttpStatusCode.Forbidden, response.status)
     }
 
@@ -544,13 +505,8 @@ class ApiRoutesExtendedTest {
     fun `PUT notification-preferences requires auth`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         val response =
             client.put("/v1/notification-preferences") {
@@ -564,13 +520,8 @@ class ApiRoutesExtendedTest {
     fun `GET notification-preferences without token returns 401`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         assertEquals(HttpStatusCode.Unauthorized, client.get("/v1/notification-preferences").status)
     }
@@ -579,13 +530,8 @@ class ApiRoutesExtendedTest {
     fun `DELETE user phone-number without auth returns 401`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         assertEquals(HttpStatusCode.Unauthorized, client.delete("/v1/user/phone-number").status)
     }
@@ -594,13 +540,8 @@ class ApiRoutesExtendedTest {
     fun `GET sdk-versions without auth returns 401 under protected group`() = testApplication {
         application {
             installJwtAuth()
-            install(RateLimit) {
-                register(RateLimitName("api")) {
-                    requestKey { "api-routes-extended" }
-                    rateLimiter(limit = 1000, refillPeriod = 1.seconds)
-                }
-            }
-            routing { apiRoutes() }
+            installApiRouteRateLimits("api-routes-extended")
+            routing { apiRoutes(includePublicContactRoutes = false) }
         }
         assertEquals(HttpStatusCode.Unauthorized, client.get("/v1/sdk-versions").status)
     }

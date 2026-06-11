@@ -23,6 +23,7 @@ import com.moneat.logs.models.LogFilterOptionsWithCountsResponse
 import com.moneat.logs.models.LogQueryResponse
 import com.moneat.logs.models.LogTagValuesResponse
 import com.moneat.logs.models.LogTopResponse
+import com.moneat.logs.routes.LogRouteDependencies
 import com.moneat.logs.routes.logRoutes
 import com.moneat.logs.services.LogService
 import com.moneat.shared.models.Memberships
@@ -142,7 +143,7 @@ class LogRoutesMockTest {
 
             application {
                 installAuth()
-                routing { logRoutes(logService = mockLogService) }
+                routing { logRoutes(LogRouteDependencies(logService = mockLogService)) }
             }
 
             val response = client.get("/v1/logs") {
@@ -158,7 +159,7 @@ class LogRoutesMockTest {
             // Request without auth header → 401 (or 403 if auth rejects)
             application {
                 installAuth()
-                routing { logRoutes(logService = mockLogService) }
+                routing { logRoutes(LogRouteDependencies(logService = mockLogService)) }
             }
 
             val response = client.get("/v1/logs")
@@ -178,7 +179,7 @@ class LogRoutesMockTest {
 
             application {
                 installAuth()
-                routing { logRoutes(logService = mockLogService) }
+                routing { logRoutes(LogRouteDependencies(logService = mockLogService)) }
             }
 
             val response = client.get("/v1/logs/tag-values?key=service") {
@@ -195,7 +196,7 @@ class LogRoutesMockTest {
 
             application {
                 installAuth()
-                routing { logRoutes(logService = mockLogService) }
+                routing { logRoutes(LogRouteDependencies(logService = mockLogService)) }
             }
 
             val response = client.get("/v1/logs/tag-values") {
@@ -222,7 +223,7 @@ class LogRoutesMockTest {
 
             application {
                 installAuth()
-                routing { logRoutes(logService = mockLogService) }
+                routing { logRoutes(LogRouteDependencies(logService = mockLogService)) }
             }
 
             val response = client.get("/v1/logs/filters") {
@@ -240,14 +241,16 @@ class LogRoutesMockTest {
             val aggregateResponse = LogAggregateResponse(buckets = emptyList(), totalCount = 0L, interval = "1h")
             coEvery {
                 mockLogService.aggregateLogs(
-                    eq(orgId.toLong()), any(), any(), any(), any(), any(), any(),
-                    any(), any(), any(), any(), any(), any(), any()
+                    organizationId = eq(orgId.toLong()),
+                    filters = any(),
+                    interval = any(),
+                    groupBy = any()
                 )
             } returns aggregateResponse
 
             application {
                 installAuth()
-                routing { logRoutes(logService = mockLogService) }
+                routing { logRoutes(LogRouteDependencies(logService = mockLogService)) }
             }
 
             val response = client.get("/v1/logs/aggregate") {
@@ -266,14 +269,16 @@ class LogRoutesMockTest {
             val topResponse = LogTopResponse(field = "service", values = emptyList(), totalCount = 0L)
             coEvery {
                 mockLogService.topValues(
-                    eq(orgId.toLong()), eq("service"), any(), any(), any(), any(), any(),
-                    any(), any(), any(), any(), any(), any(), any()
+                    organizationId = eq(orgId.toLong()),
+                    field = eq("service"),
+                    limit = any(),
+                    filters = any()
                 )
             } returns topResponse
 
             application {
                 installAuth()
-                routing { logRoutes(logService = mockLogService) }
+                routing { logRoutes(LogRouteDependencies(logService = mockLogService)) }
             }
 
             val response = client.get("/v1/logs/top?field=service") {
@@ -290,7 +295,7 @@ class LogRoutesMockTest {
 
             application {
                 installAuth()
-                routing { logRoutes(logService = mockLogService) }
+                routing { logRoutes(LogRouteDependencies(logService = mockLogService)) }
             }
 
             val response = client.get("/v1/logs/top") {

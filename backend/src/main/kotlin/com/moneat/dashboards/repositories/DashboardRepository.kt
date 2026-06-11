@@ -25,19 +25,34 @@ import com.moneat.dashboards.models.UpdateDashboardRequest
 interface DashboardRepository {
     fun list(orgId: Long, projectId: Long? = null, userId: Int? = null): List<DashboardWithFavoriteFlag>
     fun getById(id: Long, orgId: Long, userId: Int? = null): DashboardWithFavoriteFlag?
-    fun create(orgId: Long, userId: Long, request: CreateDashboardRequest): CreatedDashboardData
-    fun update(id: Long, orgId: Long, request: UpdateDashboardRequest): Boolean
+    fun create(
+        orgId: Long,
+        userId: Long,
+        request: CreateDashboardRequest,
+        projectId: Long? = null,
+        folderId: Long? = null,
+    ): CreatedDashboardData
+    fun update(id: Long, orgId: Long, request: UpdateDashboardRequest, folderId: Long? = null): Boolean
     fun moveToFolder(id: Long, orgId: Long, folderId: Long?): Boolean
     fun delete(id: Long, orgId: Long): Boolean
+
+    /**
+     * Marks [id] as the org's single default ("home") dashboard, clearing the flag on
+     * every other dashboard in the org. Returns false when [id] is not in the org.
+     */
+    fun setDefault(id: Long, orgId: Long): Boolean
     fun toggleFavorite(userId: Int, dashboardId: Long, orgId: Long): Boolean
     fun search(orgId: Long, userId: Int?, pattern: String): List<DashboardWithFavoriteFlag>
 }
 
 data class DashboardWithFavoriteFlag(
     val id: Long,
+    val resourceId: String = id.toString(),
     val orgId: Long,
-    val projectId: Long?,
-    val folderId: Long?,
+    val projectId: Long? = null,
+    val projectResourceId: String? = projectId?.toString(),
+    val folderId: Long? = null,
+    val folderResourceId: String? = folderId?.toString(),
     val title: String,
     val description: String?,
     val layoutType: String,
@@ -51,8 +66,12 @@ data class DashboardWithFavoriteFlag(
 
 data class CreatedDashboardData(
     val id: Long,
+    val resourceId: String = id.toString(),
     val orgId: Long,
-    val projectId: Long?,
+    val projectId: Long? = null,
+    val projectResourceId: String? = projectId?.toString(),
+    val folderId: Long? = null,
+    val folderResourceId: String? = folderId?.toString(),
     val title: String,
     val description: String?,
     val layoutType: String,

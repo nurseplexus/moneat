@@ -82,6 +82,95 @@ interface QuotaUsageSnapshot {
   limit: number
 }
 
+type UsageEventType = 'error' | 'transaction' | 'replay' | 'feedback' | 'log'
+
+interface AdminOrgUsageRow {
+  date: string
+  eventType: string
+  eventCount: number
+  bytesIngested: number
+}
+
+interface UsageByDateRow {
+  date: string
+  error: number
+  transaction: number
+  replay: number
+  feedback: number
+  log: number
+  total: number
+}
+
+interface UsageBreakdown {
+  error: number
+  transaction: number
+  replay: number
+  feedback: number
+  log: number
+  totalEvents: number
+  totalBytes: number
+}
+
+function emptyUsageByDateRow(date: string): UsageByDateRow {
+  return {date, error: 0, transaction: 0, replay: 0, feedback: 0, log: 0, total: 0}
+}
+
+function emptyUsageBreakdown(): UsageBreakdown {
+  return {error: 0, transaction: 0, replay: 0, feedback: 0, log: 0, totalEvents: 0, totalBytes: 0}
+}
+
+function normalizeEventType(eventType: string): UsageEventType | null {
+  switch (eventType) {
+    case 'error':
+    case 'transaction':
+    case 'replay':
+    case 'feedback':
+    case 'log':
+      return eventType
+    case 'logs':
+      return 'log'
+    default:
+      return null
+  }
+}
+
+function buildUsageByDate(usage: AdminOrgUsageRow[] | undefined): UsageByDateRow[] {
+  if (!usage) return []
+  const acc: Record<string, UsageByDateRow> = {}
+  for (const row of usage) {
+    acc[row.date] ??= emptyUsageByDateRow(row.date)
+    const key = normalizeEventType(row.eventType)
+    if (key != null) {
+      acc[row.date][key] += row.eventCount
+    }
+    acc[row.date].total += row.eventCount
+  }
+  return Object.values(acc).sort((a, b) => a.date.localeCompare(b.date))
+}
+
+function buildUsageByType(usage: AdminOrgUsageRow[] | undefined): UsageBreakdown {
+  if (!usage) return emptyUsageBreakdown()
+  return usage.reduce((acc, row) => {
+    const key = normalizeEventType(row.eventType)
+    if (key != null) {
+      acc[key] += row.eventCount
+    }
+    acc.totalEvents += row.eventCount
+    acc.totalBytes += row.bytesIngested
+    return acc
+  }, emptyUsageBreakdown())
+}
+
+function calculateTargetUsage(selectedQuota: QuotaUsageSnapshot | null, parsedTargetPercent: number | null): number | null {
+  if (selectedQuota == null || parsedTargetPercent == null) return null
+  return Math.round(selectedQuota.limit * parsedTargetPercent / PERCENT_MULTIPLIER)
+}
+
+function serviceCountLabel(count: number): string {
+  if (count === 1) return '1 service'
+  return `${count} services`
+}
+
 function getQuotaUsageSnapshot(usage: BillingUsage, quotaType: AdminQuotaType): QuotaUsageSnapshot {
   switch (quotaType) {
     case 'ingestion_bytes':
@@ -122,6 +211,15 @@ function parseTargetPercent(value: string): number | null {
   return parsed
 }
 
+export const adminOrganizationHelperTestHooks = {
+  buildUsageByDate,
+  buildUsageByType,
+  calculateTargetUsage,
+  getQuotaUsageSnapshot,
+  parseTargetPercent,
+  serviceCountLabel,
+}
+
 function AdminOrgDetailPage() {
   const {orgId} = Route.useParams()
   const queryClient = useQueryClient()
@@ -129,21 +227,6 @@ function AdminOrgDetailPage() {
   const [usagePeriod, setUsagePeriod] = useState<'7d' | '30d'>('30d')
   const [quotaType, setQuotaType] = useState<AdminQuotaType>('ingestion_bytes')
   const [targetPercent, setTargetPercent] = useState('80')
-
-  const normalizeEventType = (eventType: string): 'error' | 'transaction' | 'replay' | 'feedback' | 'log' | null => {
-    switch (eventType) {
-      case 'error':
-      case 'transaction':
-      case 'replay':
-      case 'feedback':
-      case 'log':
-        return eventType
-      case 'logs':
-        return 'log'
-      default:
-        return null
-    }
-  }
 
   const {data: org, isLoading} = useQuery({
     queryKey: ['admin-org', orgId],
@@ -189,39 +272,10 @@ function AdminOrgDetailPage() {
   })
 
   // Aggregate usage by date for chart
-  const usageByDate = useMemo(() => {
-    if (!usage) return []
-    const acc: Record<
-      string,
-      {date: string; error: number; transaction: number; replay: number; feedback: number; log: number; total: number}
-    > = {}
-    for (const u of usage) {
-      if (!acc[u.date]) {
-        acc[u.date] = {date: u.date, error: 0, transaction: 0, replay: 0, feedback: 0, log: 0, total: 0}
-      }
-      const key = normalizeEventType(u.eventType)
-      if (key && key in acc[u.date]) {
-        acc[u.date][key] += u.eventCount
-      }
-      acc[u.date].total += u.eventCount
-    }
-    return Object.values(acc).sort((a, b) => a.date.localeCompare(b.date))
-  }, [usage])
+  const usageByDate = useMemo(() => buildUsageByDate(usage), [usage])
 
   // Aggregate usage by event type for breakdown
-  const usageByType = useMemo(() => {
-    if (!usage) return {error: 0, transaction: 0, replay: 0, feedback: 0, log: 0, totalEvents: 0, totalBytes: 0}
-    return usage.reduce(
-      (acc, u) => {
-        const key = normalizeEventType(u.eventType)
-        if (key && key in acc) acc[key] += u.eventCount
-        acc.totalEvents += u.eventCount
-        acc.totalBytes += u.bytesIngested
-        return acc
-      },
-      {error: 0, transaction: 0, replay: 0, feedback: 0, log: 0, totalEvents: 0, totalBytes: 0}
-    )
-  }, [usage])
+  const usageByType = useMemo(() => buildUsageByType(usage), [usage])
 
   if (isLoading || !org) {
     return <AdminSkeleton />
@@ -235,10 +289,7 @@ function AdminOrgDetailPage() {
     selectedQuota.limit > 0 &&
     parsedTargetPercent != null &&
     !quotaResetMutation.isPending
-  const targetUsage =
-    selectedQuota != null && parsedTargetPercent != null
-      ? Math.round(selectedQuota.limit * parsedTargetPercent / PERCENT_MULTIPLIER)
-      : null
+  const targetUsage = calculateTargetUsage(selectedQuota, parsedTargetPercent)
 
   return (
     <div className="space-y-8">
@@ -256,10 +307,7 @@ function AdminOrgDetailPage() {
             <h2 className="text-2xl font-bold tracking-tight">{org.name}</h2>
             <PlanBadge plan={org.plan} />
             {org.subscriptionStatus && org.subscriptionStatus !== 'active' && (
-              <Badge
-                variant="outline"
-                className="text-amber-600 border-amber-300 dark:text-amber-400 dark:border-amber-700"
-              >
+              <Badge variant="warning">
                 {org.subscriptionStatus}
               </Badge>
             )}
@@ -283,23 +331,23 @@ function AdminOrgDetailPage() {
           title="Events This Month"
           value={formatNumber(org.eventCountThisMonth)}
           icon={Zap}
-          iconColor="text-orange-600 dark:text-orange-400"
-          iconBg="bg-orange-100 dark:bg-orange-950"
+          iconColor="text-chart-7"
+          iconBg="bg-chart-7/15"
         />
         <MetricCard
           title="Bytes Ingested"
           value={formatBytes(org.bytesIngestedThisMonth)}
           subtitle="This month"
           icon={HardDrive}
-          iconColor="text-blue-600 dark:text-blue-400"
-          iconBg="bg-blue-100 dark:bg-blue-950"
+          iconColor="text-chart-1"
+          iconBg="bg-chart-1/15"
         />
         <MetricCard
           title="Members"
           value={org.memberCount}
           icon={Users}
-          iconColor="text-violet-600 dark:text-violet-400"
-          iconBg="bg-violet-100 dark:bg-violet-950"
+          iconColor="text-chart-4"
+          iconBg="bg-chart-4/15"
         />
         <Card className="relative overflow-hidden">
           <CardHeader className="flex flex-row items-center justify-between pb-2">
@@ -403,7 +451,7 @@ function AdminOrgDetailPage() {
         <div className="grid grid-cols-2 sm:grid-cols-5 gap-4">
           <Card className="px-4 py-3">
             <div className="flex items-center gap-2 text-xs text-muted-foreground mb-1">
-              <AlertCircle className="h-3 w-3 text-red-500" />
+              <AlertCircle className="h-3 w-3 text-danger-fg" />
               Errors
             </div>
             <div className="text-lg font-bold tabular-nums">{formatNumber(usageByType.error)}</div>
@@ -416,7 +464,7 @@ function AdminOrgDetailPage() {
           </Card>
           <Card className="px-4 py-3">
             <div className="flex items-center gap-2 text-xs text-muted-foreground mb-1">
-              <ArrowRightLeft className="h-3 w-3 text-blue-500" />
+              <ArrowRightLeft className="h-3 w-3 text-chart-1" />
               Transactions
             </div>
             <div className="text-lg font-bold tabular-nums">{formatNumber(usageByType.transaction)}</div>
@@ -429,7 +477,7 @@ function AdminOrgDetailPage() {
           </Card>
           <Card className="px-4 py-3">
             <div className="flex items-center gap-2 text-xs text-muted-foreground mb-1">
-              <MonitorPlay className="h-3 w-3 text-violet-500" />
+              <MonitorPlay className="h-3 w-3 text-chart-4" />
               Replays
             </div>
             <div className="text-lg font-bold tabular-nums">{formatNumber(usageByType.replay)}</div>
@@ -442,7 +490,7 @@ function AdminOrgDetailPage() {
           </Card>
           <Card className="px-4 py-3">
             <div className="flex items-center gap-2 text-xs text-muted-foreground mb-1">
-              <MessageSquare className="h-3 w-3 text-amber-500" />
+              <MessageSquare className="h-3 w-3 text-chart-5" />
               Feedback
             </div>
             <div className="text-lg font-bold tabular-nums">{formatNumber(usageByType.feedback)}</div>
@@ -455,7 +503,7 @@ function AdminOrgDetailPage() {
           </Card>
           <Card className="px-4 py-3">
             <div className="flex items-center gap-2 text-xs text-muted-foreground mb-1">
-              <FileText className="h-3 w-3 text-cyan-500" />
+              <FileText className="h-3 w-3 text-chart-6" />
               Logs
             </div>
             <div className="text-lg font-bold tabular-nums">{formatNumber(usageByType.log)}</div>
@@ -529,7 +577,7 @@ function AdminOrgDetailPage() {
         </Card>
       )}
 
-      {/* Members & Projects */}
+      {/* Members & Services */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
         <Card>
           <CardHeader>
@@ -611,9 +659,9 @@ function AdminOrgDetailPage() {
 
         <Card>
           <CardHeader>
-            <CardTitle className="text-base">Projects</CardTitle>
+            <CardTitle className="text-base">Services</CardTitle>
             <CardDescription>
-              {org.projectCount} project{org.projectCount !== 1 ? 's' : ''}
+              {serviceCountLabel(org.projectCount)}
             </CardDescription>
           </CardHeader>
           <CardContent>
@@ -645,7 +693,7 @@ function AdminOrgDetailPage() {
                 </TableBody>
               </Table>
             ) : (
-              <EmptyState message="No projects" icon={FolderKanban} />
+              <EmptyState message="No services" icon={FolderKanban} />
             )}
           </CardContent>
         </Card>

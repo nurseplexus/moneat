@@ -33,7 +33,7 @@ export interface SidebarItem {
 // Configurable sidebar items (can be hidden by user)
 // Note: 'dashboard', 'admin' and 'settings' are always visible and not included here
 export const CONFIGURABLE_SIDEBAR_ITEMS: SidebarItem[] = [
-  { key: 'performance', label: 'Performance', icon: Timer },
+  { key: 'performance', label: 'Traces', icon: Timer },
   { key: 'issues', label: 'Issues', icon: AlertCircle },
   { key: 'logs', label: 'Logs', icon: ScrollText },
   { key: 'replays', label: 'Replays', icon: Play },

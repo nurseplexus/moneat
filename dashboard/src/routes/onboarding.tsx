@@ -19,7 +19,6 @@ import {useState, useEffect} from 'react'
 import {useMutation, useQueryClient} from '@tanstack/react-query'
 import {api} from '@/lib/api'
 import {trackEvent} from '@/lib/analytics'
-import {useProject} from '@/contexts/ProjectContext'
 import {Button} from '@/components/ui/button'
 import {Input} from '@/components/ui/input'
 import {Label} from '@/components/ui/label'
@@ -28,13 +27,14 @@ import {Logo} from '@/components/Logo'
 import {Select, SelectContent, SelectItem, SelectTrigger, SelectValue} from '@/components/ui/select'
 import {Copy, Check, AlertCircle, Loader2, ArrowRight} from 'lucide-react'
 import {
-  ProjectSetupForm,
-  type ProjectSetupSubmission,
-} from '@/components/projects/ProjectSetupForm'
+  ServiceSetupForm,
+  type ServiceSetupSubmission,
+} from '@/components/projects/ServiceSetupForm'
 import {
   serializeTelemetrySourceIds,
-  storeTelemetrySourceIdsForProject,
+  storeTelemetrySourceIdsForService,
 } from '@/lib/telemetry-sources'
+import {APP_OVERVIEW_SEARCH} from '@/lib/overview-route'
 
 export const Route = createFileRoute('/onboarding')({
   beforeLoad: ({ location }) => {
@@ -74,15 +74,15 @@ function generateSlug(name: string): string {
     .substring(0, 100)
 }
 
-type OnboardingStep = 'org' | 'project'
+type OnboardingStep = 'org' | 'service'
 
 const ONBOARDING_SHELL_CLASS_NAME = 'flex min-h-dvh justify-center overflow-y-auto bg-background px-4 py-8 sm:py-12'
 const ONBOARDING_CARD_CLASS_NAME = 'my-auto w-full'
+const SLUG_CHECK_DEBOUNCE_MS = 500
 
 function OnboardingPage() {
   const navigate = useNavigate()
   const queryClient = useQueryClient()
-  const { setSelectedProjectId } = useProject()
   const [step, setStep] = useState<OnboardingStep>('org')
 
   // Org step state
@@ -97,38 +97,53 @@ function OnboardingPage() {
   const [checkingSlug, setCheckingSlug] = useState(false)
   const [slugAvailable, setSlugAvailable] = useState<boolean | null>(null)
 
-  // Project step state
-  const [projectError, setProjectError] = useState('')
-
-  // Auto-generate slug from org name
-  useEffect(() => {
-    if (!customSlug && organizationName) {
-      const generated = generateSlug(organizationName)
-      setSlug(generated)
-    }
-  }, [organizationName, customSlug])
+  // Service step state
+  const [serviceError, setServiceError] = useState('')
 
   // Check slug availability with debouncing
   useEffect(() => {
     if (!slug) {
-      setSlugAvailable(null)
       return
     }
 
+    let isCurrent = true
     const timeoutId = setTimeout(async () => {
       setCheckingSlug(true)
       try {
         const result = await api.checkSlugAvailability(slug)
-        setSlugAvailable(result.available)
+        if (isCurrent) {
+          setSlugAvailable(result.available)
+        }
       } catch {
-        setSlugAvailable(null)
+        if (isCurrent) {
+          setSlugAvailable(null)
+        }
       } finally {
-        setCheckingSlug(false)
+        if (isCurrent) {
+          setCheckingSlug(false)
+        }
       }
-    }, 500)
+    }, SLUG_CHECK_DEBOUNCE_MS)
 
-    return () => clearTimeout(timeoutId)
+    return () => {
+      isCurrent = false
+      clearTimeout(timeoutId)
+    }
   }, [slug])
+
+  const updateSlug = (value: string, isCustom: boolean) => {
+    setSlug(value)
+    setCustomSlug(isCustom)
+    setSlugAvailable(null)
+    setCheckingSlug(false)
+  }
+
+  const handleOrganizationNameChange = (value: string) => {
+    setOrganizationName(value)
+    if (!customSlug) {
+      updateSlug(generateSlug(value), false)
+    }
+  }
 
   const handleSlugChange = (value: string) => {
     // Sanitize input: lowercase, replace non-alphanumeric with hyphens
@@ -137,8 +152,7 @@ function OnboardingPage() {
       .replace(/[^a-z0-9-]/g, '-')
       .replace(/^-+|-+$/g, '')
       .substring(0, 100)
-    setSlug(sanitized)
-    setCustomSlug(true)
+    updateSlug(sanitized, true)
   }
 
   const copySlug = () => {
@@ -179,13 +193,13 @@ function OnboardingPage() {
     setLoading(true)
     try {
       // Retrieve UTM parameters from localStorage
-      const utmParamsStr = localStorage.getItem('utm_params')
+      const utmParamsStr = globalThis.localStorage.getItem('utm_params')
       let utmParams: Record<string, string | undefined> = {}
       if (utmParamsStr) {
         try {
           utmParams = JSON.parse(utmParamsStr) as Record<string, string | undefined>
         } catch {
-          localStorage.removeItem('utm_params')
+          globalThis.localStorage.removeItem('utm_params')
         }
       }
       
@@ -202,43 +216,44 @@ function OnboardingPage() {
       })
       
       // Clean up UTM params after successful onboarding
-      localStorage.removeItem('utm_params')
+      globalThis.localStorage.removeItem('utm_params')
       trackEvent('Onboarding Complete', { company_size: companySize })
       
-      setStep('project')
+      setStep('service')
     } catch {
       setError('Failed to complete onboarding. Please try again.')
       setLoading(false)
     }
   }
 
-  const createProjectMutation = useMutation({
-    mutationFn: (data: ProjectSetupSubmission) =>
+  const createServiceMutation = useMutation({
+    mutationFn: (data: ServiceSetupSubmission) =>
       api.createProject(data.name, data.framework, data.targets),
-    onSuccess: (project, submission) => {
-      storeTelemetrySourceIdsForProject(project.id, submission.sourceIds)
-      trackEvent('Onboarding Project Create', {
-        framework: project.framework || 'none',
+    onSuccess: (service, submission) => {
+      storeTelemetrySourceIdsForService(service.id, submission.sourceIds)
+      trackEvent('Onboarding Service Create', {
+        framework: service.framework || 'none',
         sources: serializeTelemetrySourceIds(submission.sourceIds),
       })
       queryClient.invalidateQueries({ queryKey: ['projects'] })
-      setSelectedProjectId(project.id)
       navigate({
-        to: '/projects/$projectId',
-        params: { projectId: String(project.id) },
-        search: { sources: serializeTelemetrySourceIds(submission.sourceIds) },
+        to: '/setup',
+        search: {
+          tab: 'services',
+          service: service.id,
+        },
       })
     },
     onError: (error: Error) => {
       if (error.message.includes('already exists')) {
-        setProjectError('A project with this name already exists. Please choose a different name.')
+        setServiceError('A service with this name already exists. Please choose a different name.')
       } else {
-        setProjectError(error.message || 'Failed to create project. Please try again.')
+        setServiceError(error.message || 'Failed to create service. Please try again.')
       }
     },
   })
 
-  if (step === 'project') {
+  if (step === 'service') {
     return (
       <div className={ONBOARDING_SHELL_CLASS_NAME}>
         <Card className={`${ONBOARDING_CARD_CLASS_NAME} max-w-3xl`}>
@@ -247,24 +262,24 @@ function OnboardingPage() {
               <Logo className="h-10" />
             </div>
             <div>
-              <CardTitle className="text-2xl">Create Your First Project</CardTitle>
+              <CardTitle className="text-2xl">Create Your First Service</CardTitle>
               <CardDescription className="mt-1">
                 Pick the application and telemetry sources you want to connect first.
               </CardDescription>
             </div>
           </CardHeader>
           <CardContent>
-            <ProjectSetupForm
+            <ServiceSetupForm
               autoFocus
-              error={projectError}
-              isSubmitting={createProjectMutation.isPending}
+              error={serviceError}
+              isSubmitting={createServiceMutation.isPending}
               submittingLabel="Creating..."
-              submitLabel="Create Project"
+              submitLabel="Create Service"
               cancelLabel="Skip for now"
-              onCancel={() => navigate({ to: '/' })}
+              onCancel={() => navigate({ to: '/', search: APP_OVERVIEW_SEARCH })}
               onSubmit={(submission) => {
-                setProjectError('')
-                createProjectMutation.mutate(submission)
+                setServiceError('')
+                createServiceMutation.mutate(submission)
               }}
             />
           </CardContent>
@@ -301,7 +316,7 @@ function OnboardingPage() {
                 type="text"
                 placeholder="Acme Inc."
                 value={organizationName}
-                onChange={(e) => setOrganizationName(e.target.value)}
+                onChange={(e) => handleOrganizationNameChange(e.target.value)}
                 required
               />
             </div>

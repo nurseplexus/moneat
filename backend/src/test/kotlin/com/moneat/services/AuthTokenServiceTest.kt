@@ -8,10 +8,19 @@ import com.moneat.shared.models.Memberships
 import com.moneat.shared.models.Organizations
 import com.moneat.shared.models.Users
 import com.moneat.testsupport.TestDatabaseHelper
-import org.jetbrains.exposed.v1.core.*
-import org.jetbrains.exposed.v1.jdbc.*
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.jdbc.Database
+import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
-import kotlin.test.*
+import kotlin.test.BeforeTest
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFailsWith
+import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class AuthTokenServiceTest {
     private val service = AuthTokenService()
@@ -59,6 +68,26 @@ class AuthTokenServiceTest {
             orgId
         }
 
+    private fun generateToken(
+        userId: Int,
+        name: String,
+        scopes: List<String>,
+    ) = service.generateToken(
+        userId = userId,
+        orgId = orgIdForToken(userId),
+        name = name,
+        scopes = scopes
+    )
+
+    private fun orgIdForToken(userId: Int): Int =
+        transaction {
+            Memberships
+                .selectAll()
+                .where { Memberships.user_id eq userId }
+                .firstOrNull()
+                ?.get(Memberships.organization_id)
+        } ?: seedOrgAndMembership(userId)
+
     // ──── hasScope ────
 
     @Test
@@ -95,7 +124,7 @@ class AuthTokenServiceTest {
         val userId = seedUser()
         seedOrgAndMembership(userId)
 
-        val result = service.generateToken(userId, "my-token", listOf("project:read"))
+        val result = generateToken(userId, "my-token", listOf("project:read"))
         assertNotNull(result.token)
         assertTrue(result.token!!.startsWith("sntrys_"))
         assertEquals("my-token", result.name)
@@ -106,7 +135,7 @@ class AuthTokenServiceTest {
     fun `generateToken rejects invalid scopes`() {
         val userId = seedUser()
         assertFailsWith<IllegalArgumentException> {
-            service.generateToken(userId, "my-token", listOf("invalid:scope"))
+            generateToken(userId, "my-token", listOf("invalid:scope"))
         }
     }
 
@@ -114,7 +143,7 @@ class AuthTokenServiceTest {
     fun `generateToken rejects blank name`() {
         val userId = seedUser()
         assertFailsWith<IllegalArgumentException> {
-            service.generateToken(userId, "", listOf("project:read"))
+            generateToken(userId, "", listOf("project:read"))
         }
     }
 
@@ -124,7 +153,7 @@ class AuthTokenServiceTest {
     fun `validateToken returns user info for valid token`() {
         val userId = seedUser()
         seedOrgAndMembership(userId)
-        val created = service.generateToken(userId, "test", listOf("project:read"))
+        val created = generateToken(userId, "test", listOf("project:read"))
 
         val result = service.validateToken(created.token!!)
         assertNotNull(result)
@@ -146,7 +175,7 @@ class AuthTokenServiceTest {
     fun `validateToken updates last_used_at`() {
         val userId = seedUser()
         seedOrgAndMembership(userId)
-        val created = service.generateToken(userId, "test", listOf("project:read"))
+        val created = generateToken(userId, "test", listOf("project:read"))
 
         service.validateToken(created.token!!)
 
@@ -166,8 +195,8 @@ class AuthTokenServiceTest {
     fun `listUserTokens returns all user tokens`() {
         val userId = seedUser()
         seedOrgAndMembership(userId)
-        service.generateToken(userId, "token-1", listOf("project:read"))
-        service.generateToken(userId, "token-2", listOf("org:read"))
+        generateToken(userId, "token-1", listOf("project:read"))
+        generateToken(userId, "token-2", listOf("org:read"))
 
         val tokens = service.listUserTokens(userId)
         assertEquals(2, tokens.size)
@@ -186,7 +215,7 @@ class AuthTokenServiceTest {
     fun `revokeToken deletes the token`() {
         val userId = seedUser()
         seedOrgAndMembership(userId)
-        val created = service.generateToken(userId, "to-revoke", listOf("project:read"))
+        val created = generateToken(userId, "to-revoke", listOf("project:read"))
 
         assertTrue(service.revokeToken(userId, created.id))
         assertTrue(service.listUserTokens(userId).isEmpty())
@@ -197,7 +226,7 @@ class AuthTokenServiceTest {
         val userId = seedUser("user1@test.com")
         val otherUser = seedUser("user2@test.com")
         seedOrgAndMembership(userId)
-        val created = service.generateToken(userId, "token", listOf("project:read"))
+        val created = generateToken(userId, "token", listOf("project:read"))
 
         assertFalse(service.revokeToken(otherUser, created.id))
     }
@@ -214,7 +243,7 @@ class AuthTokenServiceTest {
     fun `updateToken updates name`() {
         val userId = seedUser()
         seedOrgAndMembership(userId)
-        val created = service.generateToken(userId, "old-name", listOf("project:read"))
+        val created = generateToken(userId, "old-name", listOf("project:read"))
 
         assertTrue(service.updateToken(userId, created.id, "new-name", null))
         val tokens = service.listUserTokens(userId)
@@ -225,7 +254,7 @@ class AuthTokenServiceTest {
     fun `updateToken updates scopes`() {
         val userId = seedUser()
         seedOrgAndMembership(userId)
-        val created = service.generateToken(userId, "token", listOf("project:read"))
+        val created = generateToken(userId, "token", listOf("project:read"))
 
         assertTrue(service.updateToken(userId, created.id, null, listOf("project:read", "org:read")))
         val tokens = service.listUserTokens(userId)
@@ -236,7 +265,7 @@ class AuthTokenServiceTest {
     fun `updateToken rejects invalid scopes`() {
         val userId = seedUser()
         seedOrgAndMembership(userId)
-        val created = service.generateToken(userId, "token", listOf("project:read"))
+        val created = generateToken(userId, "token", listOf("project:read"))
 
         assertFailsWith<IllegalArgumentException> {
             service.updateToken(userId, created.id, null, listOf("bad:scope"))
@@ -248,7 +277,7 @@ class AuthTokenServiceTest {
         val userId = seedUser("user1@test.com")
         val otherUser = seedUser("user2@test.com")
         seedOrgAndMembership(userId)
-        val created = service.generateToken(userId, "token", listOf("project:read"))
+        val created = generateToken(userId, "token", listOf("project:read"))
 
         assertFalse(service.updateToken(otherUser, created.id, "renamed", null))
     }
@@ -261,5 +290,10 @@ class AuthTokenServiceTest {
         assertTrue(AuthTokenService.VALID_SCOPES.contains("releases:write"))
         assertTrue(AuthTokenService.VALID_SCOPES.contains("sourcemaps:write"))
         assertTrue(AuthTokenService.VALID_SCOPES.contains("org:read"))
+        assertTrue(AuthTokenService.VALID_SCOPES.contains("workflow:read"))
+        assertTrue(AuthTokenService.VALID_SCOPES.contains("workflow:write"))
+        assertTrue(AuthTokenService.VALID_SCOPES.contains("workflow:run"))
+        assertTrue(AuthTokenService.VALID_SCOPES.contains("security:read"))
+        assertTrue(AuthTokenService.VALID_SCOPES.contains("security:write"))
     }
 }

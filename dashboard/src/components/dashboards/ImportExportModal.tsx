@@ -50,7 +50,7 @@ interface ImportExportModalProps {
   open: boolean
   onOpenChange: (open: boolean) => void
   mode: 'import' | 'export'
-  dashboardId?: number
+  dashboardId?: string
 }
 
 export function ImportExportModal({open, onOpenChange, mode, dashboardId}: ImportExportModalProps) {
@@ -61,7 +61,7 @@ export function ImportExportModal({open, onOpenChange, mode, dashboardId}: Impor
   const [format, setFormat] = useState<DashboardImportFormat>('grafana')
   const [warnings, setWarnings] = useState<string[]>([])
   const [importSuccess, setImportSuccess] = useState(false)
-  const [importedDashboardId, setImportedDashboardId] = useState<number | null>(null)
+  const [importedDashboardId, setImportedDashboardId] = useState<string | null>(null)
   const [exportData, setExportData] = useState<string>('')
   const [showDataSourceMapper, setShowDataSourceMapper] = useState(false)
   const [unmappedDataSources, setUnmappedDataSources] = useState<string[]>([])
@@ -89,7 +89,7 @@ export function ImportExportModal({open, onOpenChange, mode, dashboardId}: Impor
       {name: 'analytics_events', label: 'Analytics Events', fields: []},
     ]
     
-    const custom = (customDataSourcesData || []).map(ds => ({
+    const custom = (customDataSourcesData ?? []).map(ds => ({
       name: `custom:${ds.id}`,
       label: `${ds.name} (${ds.source_type})`,
       fields: [],
@@ -203,14 +203,14 @@ export function ImportExportModal({open, onOpenChange, mode, dashboardId}: Impor
       for (const ds of foundDataSources) {
         // Check if it's a built-in source - these don't need mapping
         if (builtInSources.has(ds)) {
-          console.log(`  ${ds} -> matched built-in, no mapping needed`)
+          console.log(`${ds} -> matched built-in, no mapping needed`)
           continue
         }
         
         // Everything else is external and needs to be mapped to a custom datasource
         // Even if we have a matching source_type, we can't assume which specific
         // custom datasource the user wants (they might have multiple Prometheus sources)
-        console.log(`  ${ds} -> external datasource, needs mapping`)
+        console.log(`${ds} -> external datasource, needs mapping`)
         unmapped.push(ds)
       }
       
@@ -370,13 +370,13 @@ export function ImportExportModal({open, onOpenChange, mode, dashboardId}: Impor
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center">
       <div className="fixed inset-0 bg-black/50" onClick={() => onOpenChange(false)} />
-      <div className="relative bg-background border rounded-lg shadow-xl w-[520px] max-h-[80vh] flex flex-col">
+      <div className="relative bg-background border rounded-lg w-[520px] max-h-[80vh] flex flex-col">
         {/* Header */}
         <div className="px-5 py-4 border-b">
           <h2 className="text-lg font-semibold flex items-center gap-2">
             {mode === 'import' ? 'Import Dashboard' : 'Export Dashboard'}
             {mode === 'import' && (
-              <span className="text-xs font-normal px-2 py-0.5 rounded bg-amber-100 dark:bg-amber-950 text-amber-700 dark:text-amber-300 border border-amber-200 dark:border-amber-800">
+              <span className="text-xs font-normal px-2 py-0.5 rounded bg-warning-bg text-warning-fg border border-warning-border">
                 Experimental
               </span>
             )}
@@ -392,7 +392,8 @@ export function ImportExportModal({open, onOpenChange, mode, dashboardId}: Impor
         <div className="flex-1 overflow-auto px-5 py-4 space-y-4">
           {mode === 'import' ? (
             <>
-              <div className="grid grid-cols-2 gap-2" role="group" aria-label="Import format">
+              <fieldset className="grid grid-cols-2 gap-2">
+                <legend className="sr-only">Import format</legend>
                 <Button
                   variant={format === 'grafana' ? 'default' : 'outline'}
                   size="sm"
@@ -409,7 +410,7 @@ export function ImportExportModal({open, onOpenChange, mode, dashboardId}: Impor
                 >
                   Datadog
                 </Button>
-              </div>
+              </fieldset>
 
               {/* Format logo/info */}
               <div className="flex items-center gap-3 p-3 rounded-lg border bg-muted/30">
@@ -459,11 +460,11 @@ export function ImportExportModal({open, onOpenChange, mode, dashboardId}: Impor
 
               {/* Warnings */}
               {warnings.length > 0 && (
-                <div className="rounded-md border border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-950 p-3">
-                  <div className="flex items-center gap-2 text-amber-600 dark:text-amber-400 text-xs font-medium mb-1">
+                <div className="rounded-md border border-warning-border bg-warning-bg p-3">
+                  <div className="flex items-center gap-2 text-warning-fg text-xs font-medium mb-1">
                     <AlertTriangle className="h-3.5 w-3.5" /> Import Warnings
                   </div>
-                  <ul className="text-xs text-amber-700 dark:text-amber-300 space-y-0.5">
+                  <ul className="text-xs text-warning-fg/90 space-y-0.5">
                     {warnings.map((w, i) => (
                       <li key={i}>• {w}</li>
                     ))}
@@ -473,10 +474,10 @@ export function ImportExportModal({open, onOpenChange, mode, dashboardId}: Impor
 
               {/* Success */}
               {importSuccess && (
-                <div className="rounded-md border border-green-200 bg-green-50 dark:border-green-800 dark:bg-green-950 p-3 flex items-center justify-between">
+                <div className="rounded-md border border-success-border bg-success-bg p-3 flex items-center justify-between">
                   <div className="flex items-center gap-2">
-                    <Check className="h-4 w-4 text-green-600 dark:text-green-400" />
-                    <span className="text-xs text-green-700 dark:text-green-300">
+                    <Check className="h-4 w-4 text-success-fg" />
+                    <span className="text-xs text-success-fg">
                       Dashboard imported successfully!
                     </span>
                   </div>

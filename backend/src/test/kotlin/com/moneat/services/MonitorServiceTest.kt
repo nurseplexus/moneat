@@ -29,10 +29,20 @@ import io.mockk.mockkObject
 import io.mockk.slot
 import io.mockk.unmockkObject
 import kotlinx.coroutines.runBlocking
-import org.jetbrains.exposed.v1.core.*
-import org.jetbrains.exposed.v1.jdbc.*
+import org.jetbrains.exposed.v1.core.eq
+import org.jetbrains.exposed.v1.jdbc.Database
+import org.jetbrains.exposed.v1.jdbc.deleteAll
+import org.jetbrains.exposed.v1.jdbc.deleteWhere
+import org.jetbrains.exposed.v1.jdbc.insert
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
-import kotlin.test.*
+import kotlin.test.AfterTest
+import kotlin.test.BeforeTest
+import kotlin.test.Test
+import kotlin.test.assertEquals
+import kotlin.test.assertFalse
+import kotlin.test.assertNotNull
+import kotlin.test.assertNull
+import kotlin.test.assertTrue
 
 class MonitorServiceTest {
     private val service = MonitorService(HostRepositoryImpl(), HostAlertRepositoryImpl())
@@ -99,7 +109,7 @@ class MonitorServiceTest {
             } get PricingTierConfigs.id
         }
 
-    private fun seedHost(orgId: Int, name: String = "test-server"): Int =
+    private fun seedHost(orgId: Int, name: String = "test-server", rawTags: String = "{}"): Int =
         transaction {
             val now = kotlin.time.Clock.System.now()
             val hostId = Hosts.insert {
@@ -107,6 +117,7 @@ class MonitorServiceTest {
                 it[display_name] = name
                 it[hostname] = name
                 it[status] = "pending"
+                it[tags] = rawTags
                 it[first_seen_at] = now
                 it[last_seen_at] = now
             } get Hosts.id
@@ -146,6 +157,28 @@ class MonitorServiceTest {
         val hosts1 = service.listHosts(org1)
         assertEquals(1, hosts1.size)
         assertEquals("server-1", hosts1[0].displayName)
+    }
+
+    @Test
+    fun `listHosts ignores nested host tag values`() {
+        val orgId = seedOrg()
+        seedHost(
+            orgId = orgId,
+            name = "server-with-tags",
+            rawTags = """
+                {
+                  "env": "production",
+                  "team": "infra",
+                  "blank": "",
+                  "roles": ["web"],
+                  "cloud": {"region": "sfo3"}
+                }
+            """.trimIndent()
+        )
+
+        val host = service.listHosts(orgId).single()
+
+        assertEquals(mapOf("env" to "production", "team" to "infra"), host.tags)
     }
 
     // ──── getHostById ────

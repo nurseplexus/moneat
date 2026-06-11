@@ -17,6 +17,7 @@
 package com.moneat.di
 
 import com.moneat.ai.AiChatService
+import com.moneat.alerts.services.AlertEpisodeService
 import com.moneat.analytics.services.AnalyticsService
 import com.moneat.analytics.services.GeoIpService
 import com.moneat.analytics.services.SessionHashService
@@ -47,6 +48,7 @@ import com.moneat.dashboards.services.CustomDataSourceExecutor
 import com.moneat.dashboards.services.CustomDataSourceService
 import com.moneat.dashboards.services.DashboardAlertService
 import com.moneat.dashboards.services.DashboardQueryEngine
+import com.moneat.dashboards.services.DashboardTemplateCatalogService
 import com.moneat.events.repositories.EventRepository
 import com.moneat.events.repositories.EventRepositoryImpl
 import com.moneat.events.repositories.IssueRepository
@@ -65,14 +67,24 @@ import com.moneat.llm.services.LlmDashboardService
 import com.moneat.logs.repositories.LogRepository
 import com.moneat.logs.repositories.LogRepositoryImpl
 import com.moneat.logs.services.LogIndexService
+import com.moneat.logs.services.LogManagementService
 import com.moneat.logs.services.LogService
 import com.moneat.monitor.repositories.HostAlertRepository
 import com.moneat.monitor.repositories.HostAlertRepositoryImpl
 import com.moneat.monitor.repositories.HostRepository
 import com.moneat.monitor.repositories.HostRepositoryImpl
 import com.moneat.monitor.services.AgentApiKeyService
+import com.moneat.monitor.services.ClickHouseCloudResourceWriter
+import com.moneat.monitor.services.CloudResourceWriter
+import com.moneat.monitor.services.CloudSourceService
+import com.moneat.monitor.services.CloudSourceVerifier
+import com.moneat.monitor.services.ManagedIdentityCloudSourceVerifier
 import com.moneat.monitor.services.MonitorAlertService
 import com.moneat.monitor.services.MonitorService
+import com.moneat.monitor.services.ResourceCatalogService
+import com.moneat.security.detection.DetectionScheduler
+import com.moneat.security.vulnerabilities.VulnerabilityAdvisorySyncJob
+import com.moneat.contact.services.ContactService
 import com.moneat.notifications.services.AlertNotificationPreferencesService
 import com.moneat.notifications.services.DiscordService
 import com.moneat.notifications.services.EmailService
@@ -93,8 +105,11 @@ import com.moneat.shared.repositories.OrganizationRepository
 import com.moneat.shared.repositories.OrganizationRepositoryImpl
 import com.moneat.shared.services.ArtifactCleanupService
 import com.moneat.shared.services.AttributionAnalyticsService
+import com.moneat.shared.services.DemoLivenessBackgroundService
+import com.moneat.shared.services.ProjectIdResolver
 import com.moneat.shared.services.RetentionBackgroundService
 import com.moneat.shared.services.RetentionPolicyService
+import com.moneat.shared.services.TraceFinalizerBackgroundService
 import com.moneat.statuspage.services.StatusPageService
 import com.moneat.summary.services.SummaryService
 import com.moneat.synthetics.routes.SyntheticsService
@@ -103,7 +118,19 @@ import com.moneat.uptime.repositories.UptimeMonitorRepositoryImpl
 import com.moneat.uptime.services.UptimeCheckExecutor
 import com.moneat.uptime.services.UptimeScheduler
 import com.moneat.uptime.services.UptimeService
+import com.moneat.workflows.engine.temporal.ExecuteActionActivityImpl
+import com.moneat.workflows.engine.temporal.ExecuteEgressActionActivityImpl
+import com.moneat.workflows.engine.temporal.PersistRunActivityImpl
+import com.moneat.workflows.engine.temporal.RequestApprovalActivityImpl
+import com.moneat.workflows.engine.temporal.TemporalClientProvider
+import com.moneat.workflows.engine.temporal.TemporalWorkflowExecutionEngine
+import com.moneat.workflows.engine.temporal.WorkflowExecutionEngine
+import com.moneat.workflows.services.WorkflowActionExecutor
+import com.moneat.workflows.services.WorkflowEgressActionExecutor
+import com.moneat.workflows.services.WorkflowGovernanceService
 import com.moneat.workflows.services.WorkflowService
+import com.moneat.workflows.services.WorkflowStepRenderer
+import com.moneat.workflows.services.WorkflowTrustedActionExecutor
 import org.koin.dsl.module
 
 /** Shared cross-domain singletons: notification channels, pricing, retention, shared repositories. */
@@ -112,10 +139,31 @@ val sharedModule = module {
     single<OrganizationRepository> { OrganizationRepositoryImpl() }
 
     single { EmailService() }
+    single { ContactService(get()) }
     single { SlackService() }
     single { DiscordService() }
     single { AlertNotificationPreferencesService() }
-    single { WorkflowService(get(), get(), get()) }
+    single { AlertEpisodeService() }
+    single { WorkflowStepRenderer() }
+    single {
+        WorkflowTrustedActionExecutor(
+            logService = get(),
+            dashboardService = get(),
+            monitorService = get(),
+            monitorAlertServiceProvider = { get<MonitorAlertService>() },
+            statusPageService = get(),
+        )
+    }
+    single { WorkflowActionExecutor(get(), get(), get(), get(), get()) }
+    single { WorkflowEgressActionExecutor() }
+    single { PersistRunActivityImpl() }
+    single { RequestApprovalActivityImpl() }
+    single { ExecuteActionActivityImpl(get()) }
+    single { ExecuteEgressActionActivityImpl(get()) }
+    single { TemporalClientProvider() }
+    single<WorkflowExecutionEngine> { TemporalWorkflowExecutionEngine(get()) }
+    single { WorkflowService(get(), get(), get(), get(), get(), get(), get(), get()) }
+    single { WorkflowGovernanceService(get()) }
     single { IncidentService(get()) }
 
     single { PricingTierService() }
@@ -123,8 +171,11 @@ val sharedModule = module {
     single { EntitlementService(get()) }
     single { RetentionPolicyService(get()) }
     single { RetentionBackgroundService(get()) }
+    single { TraceFinalizerBackgroundService.fromConfig() }
+    single { ProjectIdResolver() }
 
     single { AttributionAnalyticsService() }
+    single { DemoLivenessBackgroundService() }
 }
 
 /** Authentication, token management, and account lifecycle. */
@@ -194,7 +245,7 @@ val eventsModule = module {
     single { ReleaseService() }
     single { NotificationService(get(), get(), get()) }
     single { EventService(get(), get(), get()) }
-    single { DashboardService(get(), get(), get()) }
+    single { DashboardService(get(), get(), get(), get()) }
 }
 
 /** Infrastructure monitoring and alerting. */
@@ -204,8 +255,14 @@ val monitorModule = module {
 
     single { MonitorService(get(), get(), get(), get()) }
     single { MonitorAlertService(get(), get()) }
+    single { ResourceCatalogService(get()) }
+    single<CloudSourceVerifier> { ManagedIdentityCloudSourceVerifier() }
+    single<CloudResourceWriter> { ClickHouseCloudResourceWriter() }
+    single { CloudSourceService(get(), get()) }
     single { AgentApiKeyService() }
     single { SyntheticsService(get(), get()) }
+    single { DetectionScheduler() }
+    single { VulnerabilityAdvisorySyncJob() }
 }
 
 /** Log ingestion and querying. */
@@ -216,15 +273,25 @@ val logsModule = module {
     single { OtlpApiKeyService() }
     single { OtlpServiceRoutingService() }
     single { LogIndexService() }
+    single { LogManagementService() }
 }
 
 /** Uptime monitoring and status pages. */
-val uptimeModule = module {
+fun uptimeModule(frontendBaseUrl: String) = module {
     single<UptimeMonitorRepository> { UptimeMonitorRepositoryImpl() }
 
     single { UptimeService(get(), get()) }
     single { UptimeCheckExecutor() }
-    single { UptimeScheduler(get(), get(), get(), get()) }
+    single {
+        UptimeScheduler(
+            uptimeService = get(),
+            checkExecutor = get(),
+            incidentService = get(),
+            billingQuotaService = get(),
+            workflowService = get(),
+            frontendBaseUrl = frontendBaseUrl
+        )
+    }
     single { StatusPageService(get()) }
 }
 
@@ -235,6 +302,7 @@ val dashboardsModule = module {
     single<DashboardWidgetRepository> { DashboardWidgetRepositoryImpl() }
 
     single { DashboardQueryEngine() }
+    single { DashboardTemplateCatalogService() }
     single {
         DashboardAlertService(
             incidentService = get(),
@@ -288,19 +356,24 @@ val aiModule = module {
 }
 
 /** All application modules combined in load order. */
-val appModules = listOf(
-    sharedModule,
-    authModule,
-    billingModule,
-    orgModule,
-    eventsModule,
-    monitorModule,
-    logsModule,
-    uptimeModule,
-    dashboardsModule,
-    summaryModule,
-    llmModule,
-    analyticsModule,
-    featureFlagsModule,
-    aiModule,
-)
+private const val DEFAULT_FRONTEND_BASE_URL = "https://moneat.io"
+
+fun buildAppModules(frontendBaseUrl: String = DEFAULT_FRONTEND_BASE_URL) =
+    listOf(
+        sharedModule,
+        authModule,
+        billingModule,
+        orgModule,
+        eventsModule,
+        monitorModule,
+        logsModule,
+        uptimeModule(frontendBaseUrl),
+        dashboardsModule,
+        summaryModule,
+        llmModule,
+        analyticsModule,
+        featureFlagsModule,
+        aiModule,
+    )
+
+val appModules = buildAppModules()

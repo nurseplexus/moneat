@@ -23,7 +23,8 @@ import kotlinx.serialization.Serializable
 data class CreateOtlpServiceMappingRequest(
     @SerialName("service_namespace") val serviceNamespace: String? = null,
     @SerialName("service_name") val serviceName: String,
-    @SerialName("project_id") val projectId: Long,
+    @SerialName("project_id") val projectId: Long? = null,
+    @SerialName("project_resource_id") val projectResourceId: String? = null,
 )
 
 @Serializable
@@ -32,6 +33,7 @@ data class OtlpServiceMappingResponse(
     @SerialName("service_namespace") val serviceNamespace: String,
     @SerialName("service_name") val serviceName: String,
     @SerialName("project_id") val projectId: Long,
+    @SerialName("project_resource_id") val projectResourceId: String,
     @SerialName("project_name") val projectName: String,
     @SerialName("updated_at") val updatedAt: String,
 )
@@ -43,10 +45,12 @@ data class OtlpObservedServiceResponse(
     @SerialName("service_namespace") val serviceNamespace: String,
     @SerialName("service_name") val serviceName: String,
     @SerialName("project_id") val projectId: Long? = null,
+    @SerialName("project_resource_id") val projectResourceId: String? = null,
     @SerialName("project_name") val projectName: String? = null,
     @SerialName("seen_logs") val seenLogs: Boolean,
     @SerialName("seen_traces") val seenTraces: Boolean,
     @SerialName("seen_metrics") val seenMetrics: Boolean,
+    @SerialName("seen_feedback") val seenFeedback: Boolean = false,
     @SerialName("last_environment") val lastEnvironment: String? = null,
     @SerialName("first_seen_at") val firstSeenAt: String,
     @SerialName("last_seen_at") val lastSeenAt: String,

@@ -24,7 +24,7 @@ import kotlinx.serialization.descriptors.PrimitiveSerialDescriptor
 import kotlinx.serialization.descriptors.SerialDescriptor
 import kotlinx.serialization.encoding.Decoder
 import kotlinx.serialization.encoding.Encoder
-import java.util.*
+import java.util.UUID
 import kotlin.time.Instant
 
 object UUIDSerializer : KSerializer<UUID> {
@@ -190,6 +190,7 @@ data class AlertResponse(
     val threshold: Double,
     @SerialName("duration_seconds") val durationSeconds: Int,
     val enabled: Boolean,
+    @SerialName("alert_priority") val alertPriority: String? = null,
     @SerialName("last_triggered_at") val lastTriggeredAt: Long?,
     @SerialName("created_at") val createdAt: Long
 )
@@ -208,7 +209,11 @@ data class CreateAlertRequest(
     val condition: String,
     val threshold: Double,
     @SerialName("duration_seconds") val durationSeconds: Int = 0,
-    val enabled: Boolean = true
+    val enabled: Boolean = true,
+    val alertPriority: String? = null,
+    @SerialName("alert_priority") val alertPrioritySnake: String? = null,
+    val incidentSeverity: String? = null,
+    @SerialName("incident_severity") val legacyIncidentSeveritySnake: String? = null
 )
 
 @Serializable
@@ -222,7 +227,11 @@ data class UpdateAlertRequest(
     val condition: String? = null,
     val threshold: Double? = null,
     @SerialName("duration_seconds") val durationSeconds: Int? = null,
-    val enabled: Boolean? = null
+    val enabled: Boolean? = null,
+    val alertPriority: String? = null,
+    @SerialName("alert_priority") val alertPrioritySnake: String? = null,
+    val incidentSeverity: String? = null,
+    @SerialName("incident_severity") val legacyIncidentSeveritySnake: String? = null
 )
 
 // Internal data classes
@@ -242,6 +251,7 @@ data class HostData(
     val processor: String? = null,
     val cpuCores: Int? = null,
     val memoryTotalKb: Long? = null,
+    val tags: Map<String, String> = emptyMap(),
     @Serializable(with = KotlinInstantSerializer::class)
     val firstSeenAt: kotlin.time.Instant,
     @Serializable(with = KotlinInstantSerializer::class)
@@ -277,6 +287,7 @@ data class AlertData(
     val enabled: Boolean,
     val lastTriggeredAt: kotlin.time.Instant?,
     val createdAt: kotlin.time.Instant,
+    val alertPriority: String? = null,
     val scope: String = "host",
     val templateAlertId: Int? = null
 )
@@ -293,6 +304,7 @@ data class AlertRow(
     val enabled: Boolean,
     val lastTriggeredAt: kotlin.time.Instant?,
     val createdAt: kotlin.time.Instant,
+    val alertPriority: String? = null,
     val scope: String = "host"
 )
 
@@ -313,6 +325,7 @@ data class CreateAlertData(
     val threshold: Double,
     val durationSeconds: Int,
     val enabled: Boolean,
+    val alertPriority: String?,
     val scope: String
 )
 
@@ -322,7 +335,8 @@ data class UpdateAlertData(
     val condition: String? = null,
     val threshold: Double? = null,
     val durationSeconds: Int? = null,
-    val enabled: Boolean? = null
+    val enabled: Boolean? = null,
+    val alertPriority: String? = null
 )
 
 @Serializable

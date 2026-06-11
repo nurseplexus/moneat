@@ -27,8 +27,11 @@ import com.moneat.events.models.TransactionDetailResponse
 import com.moneat.events.models.TransactionSummaryResponse
 import com.moneat.events.models.TransactionWithSpansResponse
 import com.moneat.shared.models.Projects
+import com.moneat.shared.services.ProjectIdResolver
 import com.moneat.utils.ClickHouseQueryUtils
 import com.moneat.utils.ClickHouseSqlUtils.escapeSql
+import com.moneat.utils.HttpConstants.HTTP_SUCCESS_RANGE
+import com.moneat.utils.suspendRunCatching
 import io.ktor.client.statement.bodyAsText
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.contentOrNull
@@ -40,12 +43,13 @@ import mu.KotlinLogging
 import org.jetbrains.exposed.v1.core.eq
 import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
-import com.moneat.utils.suspendRunCatching
-import com.moneat.utils.HttpConstants.HTTP_SUCCESS_RANGE
 
 private val logger = KotlinLogging.logger {}
 
-class TransactionService(private val queryHelper: DashboardQueryHelper) {
+class TransactionService(
+    private val queryHelper: DashboardQueryHelper,
+    private val projectIdResolver: ProjectIdResolver = ProjectIdResolver(),
+) {
     private val clickhouseDb: String get() = queryHelper.clickhouseDb
     private val json get() = queryHelper.json
 
@@ -71,6 +75,9 @@ class TransactionService(private val queryHelper: DashboardQueryHelper) {
                 .firstOrNull()
                 ?.get(Projects.organization_id)
         }
+
+    private fun projectResourceId(projectId: Long): String =
+        projectIdResolver.resourceIdFor(projectId) ?: ""
 
     private fun mapSpanRowFromApm(obj: JsonObject): SpanResponse {
         val startNs = obj["start_ns"]?.jsonPrimitive?.contentOrNull?.toLongOrNull() ?: 0L
@@ -402,7 +409,7 @@ class TransactionService(private val queryHelper: DashboardQueryHelper) {
             return EventTraceResponse(
                 eventId = lookup.eventId,
                 eventType = lookup.eventType,
-                projectId = lookup.projectId,
+                projectId = projectResourceId(lookup.projectId),
                 traceId = "",
                 transaction = null,
                 spans = emptyList()
@@ -419,7 +426,7 @@ class TransactionService(private val queryHelper: DashboardQueryHelper) {
         return EventTraceResponse(
             eventId = lookup.eventId,
             eventType = lookup.eventType,
-            projectId = lookup.projectId,
+            projectId = projectResourceId(lookup.projectId),
             traceId = lookup.traceId,
             transaction = transactionWithSpans?.transaction,
             spans = transactionWithSpans?.spans?.takeIf { it.isNotEmpty() } ?: traceSpans
@@ -431,7 +438,7 @@ class TransactionService(private val queryHelper: DashboardQueryHelper) {
         return EventTraceResponse(
             eventId = null,
             eventType = null,
-            projectId = projectId,
+            projectId = projectResourceId(projectId),
             traceId = traceId,
             transaction = null,
             spans = trace.spans
@@ -476,7 +483,7 @@ class TransactionService(private val queryHelper: DashboardQueryHelper) {
 
             TraceDetailResponse(
                 traceId = traceId,
-                projectId = projectId,
+                projectId = projectResourceId(projectId),
                 spans = spans,
                 startTimestamp = startTs,
                 endTimestamp = endTs,

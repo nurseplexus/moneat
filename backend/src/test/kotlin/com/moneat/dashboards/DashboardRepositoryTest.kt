@@ -55,6 +55,7 @@ CREATE TABLE IF NOT EXISTS users (
 private const val CREATE_FOLDERS_DDL = """
 CREATE TABLE IF NOT EXISTS dashboard_folders (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    resource_id UUID DEFAULT RANDOM_UUID() NOT NULL,
     org_id BIGINT NOT NULL,
     name VARCHAR(100) NOT NULL,
     color VARCHAR(7) NULL,
@@ -66,6 +67,7 @@ CREATE TABLE IF NOT EXISTS dashboard_folders (
 private const val CREATE_DASHBOARDS_DDL = """
 CREATE TABLE IF NOT EXISTS dashboards (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    resource_id UUID DEFAULT RANDOM_UUID() NOT NULL,
     org_id BIGINT NOT NULL,
     project_id BIGINT NULL,
     folder_id BIGINT NULL,
@@ -94,6 +96,7 @@ CREATE TABLE IF NOT EXISTS dashboard_favorites (
 private const val CREATE_WIDGETS_DDL = """
 CREATE TABLE IF NOT EXISTS dashboard_widgets (
     id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    resource_id UUID DEFAULT RANDOM_UUID() NOT NULL,
     dashboard_id BIGINT NOT NULL,
     title VARCHAR(255) NULL,
     widget_type VARCHAR(50) NOT NULL,
@@ -360,6 +363,26 @@ class DashboardRepositoryTest {
         repository.update(created.id, ORG_ID, UpdateDashboardRequest(layoutType = "free"))
         val found = repository.getById(created.id, ORG_ID)
         assertEquals("free", found?.layoutType)
+    }
+
+    // ──── setDefault ────
+
+    @Test
+    fun `setDefault marks one dashboard and clears the others`() {
+        val first = createDashboard(title = "First")
+        val second = createDashboard(title = "Second")
+
+        assertTrue(repository.setDefault(first.id, ORG_ID))
+        assertTrue(repository.getById(first.id, ORG_ID)!!.isDefault)
+
+        assertTrue(repository.setDefault(second.id, ORG_ID))
+        assertTrue(repository.getById(second.id, ORG_ID)!!.isDefault)
+        assertFalse(repository.getById(first.id, ORG_ID)!!.isDefault)
+    }
+
+    @Test
+    fun `setDefault returns false for a non-existent dashboard`() {
+        assertFalse(repository.setDefault(999_999L, ORG_ID))
     }
 
     // ──── Dashboard Delete ────

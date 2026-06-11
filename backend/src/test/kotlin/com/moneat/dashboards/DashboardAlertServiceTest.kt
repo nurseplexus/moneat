@@ -34,7 +34,7 @@ import com.moneat.dashboards.services.DataSourceCredentials
 import com.moneat.dashboards.services.DashboardAlertService
 import com.moneat.dashboards.services.DashboardQueryEngine
 import com.moneat.alerts.models.AlertSource
-import com.moneat.alerts.models.AlertSeverity
+import com.moneat.alerts.models.AlertPriority
 import com.moneat.incident.services.IncidentService
 import com.moneat.shared.services.RetentionPolicyService
 import com.moneat.testsupport.TestDatabaseHelper
@@ -51,8 +51,10 @@ import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonPrimitive
 import org.jetbrains.exposed.v1.jdbc.Database
 import org.jetbrains.exposed.v1.jdbc.insert
+import org.jetbrains.exposed.v1.jdbc.selectAll
 import org.jetbrains.exposed.v1.jdbc.transactions.TransactionManager
 import org.jetbrains.exposed.v1.jdbc.transactions.transaction
+import org.jetbrains.exposed.v1.core.eq
 import kotlin.reflect.full.callSuspend
 import kotlin.reflect.full.declaredFunctions
 import kotlin.reflect.jvm.isAccessible
@@ -66,6 +68,7 @@ import kotlin.test.assertNotNull
 import kotlin.test.assertNull
 import kotlin.test.assertTrue
 import kotlin.time.Clock
+import kotlin.uuid.Uuid
 
 class DashboardAlertServiceTest {
 
@@ -89,6 +92,7 @@ class DashboardAlertServiceTest {
     companion object {
         private var db: Database? = null
         private const val ORG_ID = 1L
+        private const val OTHER_ORG_ID = 2L
         private const val CREATED_BY = 100L
         private const val DEFAULT_PROJECT_ID = 1L
         private const val RECOVERY_RETENTION_DAYS = 90
@@ -118,6 +122,7 @@ class DashboardAlertServiceTest {
                 """
                 CREATE TABLE IF NOT EXISTS dashboard_folders (
                     id BIGSERIAL PRIMARY KEY,
+                    resource_id UUID DEFAULT RANDOM_UUID() NOT NULL,
                     org_id BIGINT NOT NULL,
                     name VARCHAR(100) NOT NULL,
                     color VARCHAR(7),
@@ -131,6 +136,7 @@ class DashboardAlertServiceTest {
                 """
                 CREATE TABLE IF NOT EXISTS dashboards (
                     id BIGSERIAL PRIMARY KEY,
+                    resource_id UUID DEFAULT RANDOM_UUID() NOT NULL,
                     org_id BIGINT NOT NULL,
                     project_id BIGINT,
                     folder_id BIGINT,
@@ -151,6 +157,7 @@ class DashboardAlertServiceTest {
                 """
                 CREATE TABLE IF NOT EXISTS dashboard_widgets (
                     id BIGSERIAL PRIMARY KEY,
+                    resource_id UUID DEFAULT RANDOM_UUID() NOT NULL,
                     dashboard_id BIGINT NOT NULL,
                     title VARCHAR(255),
                     widget_type VARCHAR(50) NOT NULL,
@@ -173,6 +180,7 @@ class DashboardAlertServiceTest {
                 """
                 CREATE TABLE IF NOT EXISTS dashboard_widget_alerts (
                     id BIGSERIAL PRIMARY KEY,
+                    resource_id UUID DEFAULT RANDOM_UUID() NOT NULL,
                     widget_id BIGINT NOT NULL,
                     dashboard_id BIGINT NOT NULL,
                     org_id BIGINT NOT NULL,
@@ -182,7 +190,7 @@ class DashboardAlertServiceTest {
                     warning_threshold DOUBLE PRECISION,
                     metric_index INT DEFAULT 0 NOT NULL,
                     duration_seconds INT DEFAULT 0 NOT NULL,
-                    incident_severity VARCHAR(20),
+                    alert_priority VARCHAR(20),
                     enabled BOOLEAN DEFAULT TRUE NOT NULL,
                     notification_channels TEXT NOT NULL, -- H2: JSONB unsupported; production uses JSONB
                     last_triggered_at TIMESTAMP,
@@ -229,12 +237,13 @@ class DashboardAlertServiceTest {
 
     private fun seedDashboard(
         title: String = "Test Dashboard",
-        projectId: Long? = DEFAULT_PROJECT_ID
+        projectId: Long? = DEFAULT_PROJECT_ID,
+        orgId: Long = ORG_ID
     ): Long =
         transaction {
             val now = Clock.System.now()
             Dashboards.insert {
-                it[orgId] = ORG_ID
+                it[Dashboards.orgId] = orgId
                 it[Dashboards.projectId] = projectId
                 it[Dashboards.title] = title
                 it[createdBy] = CREATED_BY
@@ -262,6 +271,30 @@ class DashboardAlertServiceTest {
             } get DashboardWidgets.id
         }
 
+    private fun dashboardResourceId(dashboardId: Long): String =
+        transaction {
+            Dashboards.selectAll().where {
+                Dashboards.id eq dashboardId
+            }.single()[Dashboards.resourceId].toString()
+        }
+
+    private fun widgetResourceId(widgetId: Long): String =
+        transaction {
+            DashboardWidgets.selectAll().where {
+                DashboardWidgets.id eq widgetId
+            }.single()[DashboardWidgets.resourceId].toString()
+        }
+
+    private fun alertNumericId(alertResourceId: String): Long =
+        transaction {
+            DashboardWidgetAlerts.selectAll().where {
+                DashboardWidgetAlerts.resourceId eq Uuid.parse(alertResourceId)
+            }.single()[DashboardWidgetAlerts.id]
+        }
+
+    private fun customDataSourceResourceId(id: Long): String =
+        "00000000-0000-0000-0000-${id.toString().padStart(12, '0')}"
+
     private data class AlertRequestOverrides(
         val name: String = "High Error Rate",
         val condition: String = ">",
@@ -269,7 +302,7 @@ class DashboardAlertServiceTest {
         val warningThreshold: Double? = null,
         val metricIndex: Int = 0,
         val durationSeconds: Int = 0,
-        val incidentSeverity: String? = null,
+        val alertPriority: String? = null,
         val enabled: Boolean = true,
         val notificationChannels: NotificationChannels = NotificationChannels(),
     )
@@ -278,14 +311,14 @@ class DashboardAlertServiceTest {
         widgetId: Long,
         overrides: AlertRequestOverrides = AlertRequestOverrides(),
     ): CreateDashboardAlertRequest = CreateDashboardAlertRequest(
-        widgetId = widgetId,
+        widgetId = widgetResourceId(widgetId),
         name = overrides.name,
         condition = overrides.condition,
         threshold = overrides.threshold,
         warningThreshold = overrides.warningThreshold,
         metricIndex = overrides.metricIndex,
         durationSeconds = overrides.durationSeconds,
-        incidentSeverity = overrides.incidentSeverity,
+        alertPriority = overrides.alertPriority,
         enabled = overrides.enabled,
         notificationChannels = overrides.notificationChannels,
     )
@@ -296,7 +329,7 @@ class DashboardAlertServiceTest {
         enabled: Boolean = true,
         hasCredentials: Boolean = false,
     ): CustomDataSourceResponse = CustomDataSourceResponse(
-        id = id,
+        id = customDataSourceResourceId(id),
         orgId = ORG_ID,
         name = "Prometheus",
         sourceType = sourceType,
@@ -308,6 +341,7 @@ class DashboardAlertServiceTest {
         createdAt = Clock.System.now().toString(),
         updatedAt = Clock.System.now().toString(),
         hasCredentials = hasCredentials,
+        numericId = id,
     )
 
     // ──── createAlert tests ────
@@ -328,12 +362,12 @@ class DashboardAlertServiceTest {
         assertEquals(">", response.condition)
         assertEquals(100.0, response.threshold)
         assertNull(response.warningThreshold)
-        assertEquals(widgetId, response.widgetId)
-        assertEquals(dashboardId, response.dashboardId)
+        assertEquals(widgetResourceId(widgetId), response.widgetId)
+        assertEquals(dashboardResourceId(dashboardId), response.dashboardId)
         assertTrue(response.enabled)
         assertEquals(0, response.metricIndex)
         assertEquals(0, response.durationSeconds)
-        assertNull(response.incidentSeverity)
+        assertNull(response.alertPriority)
         assertNull(response.lastTriggeredAt)
         assertNull(response.lastTriggeredLevel)
         assertNull(response.lastValue)
@@ -386,13 +420,13 @@ class DashboardAlertServiceTest {
             createdBy = CREATED_BY,
             request = buildCreateRequest(
                 widgetId,
-                AlertRequestOverrides(metricIndex = 2, durationSeconds = 300, incidentSeverity = "CRITICAL"),
+                AlertRequestOverrides(metricIndex = 2, durationSeconds = 300, alertPriority = "CRITICAL"),
             ),
         )
 
         assertEquals(2, response.metricIndex)
         assertEquals(300, response.durationSeconds)
-        assertEquals("CRITICAL", response.incidentSeverity)
+        assertEquals("P0", response.alertPriority)
     }
 
     @Test
@@ -496,6 +530,23 @@ class DashboardAlertServiceTest {
                 request = buildCreateRequest(widgetId),
             )
         }
+    }
+
+    @Test
+    fun `createAlert fails when dashboard belongs to another org`() {
+        val dashboardId = seedDashboard(orgId = OTHER_ORG_ID)
+        val widgetId = seedWidget(dashboardId)
+
+        val error = assertFailsWith<IllegalArgumentException> {
+            service.createAlert(
+                dashboardId = dashboardId,
+                orgId = ORG_ID,
+                createdBy = CREATED_BY,
+                request = buildCreateRequest(widgetId),
+            )
+        }
+
+        assertEquals("Widget not found in this dashboard", error.message)
     }
 
     // ──── listAlerts tests ────
@@ -814,7 +865,7 @@ class DashboardAlertServiceTest {
                 retentionPolicyService.getRetentionDaysForProject(any())
             } returns RECOVERY_RETENTION_DAYS
             coEvery {
-                queryEngine.executeQuery(any(), any(), any(), any())
+                queryEngine.executeQuery(any(), any(), any(), any(), any())
             } returns listOf(mapOf("total" to JsonPrimitive(RECOVERED_TOTAL)))
 
             val dashboardId = seedDashboard()
@@ -833,12 +884,14 @@ class DashboardAlertServiceTest {
                         AlertRequestOverrides(
                             condition = ">",
                             threshold = RECOVERY_THRESHOLD,
-                            incidentSeverity = "HIGH",
+                            alertPriority = "HIGH",
                             notificationChannels = NotificationChannels(email = false, slack = true, discord = false),
                         ),
                     ),
                 )
-            every { redis.get("dashboard_alert_state:${created.id}") } returns "TRIGGERED"
+            val numericAlertId = alertNumericId(created.id)
+            val dashboardPublicId = dashboardResourceId(dashboardId)
+            every { redis.get("dashboard_alert_state:$numericAlertId") } returns "TRIGGERED"
             every { redis.del(any<String>()) } returns REDIS_DELETE_COUNT
 
             callPrivateSuspend("evaluateAlerts")
@@ -849,7 +902,9 @@ class DashboardAlertServiceTest {
                         it.status.name == "RESOLVED" &&
                             it.metadata["alert.channels.email"]?.jsonPrimitive?.content == "false" &&
                             it.metadata["alert.channels.slack"]?.jsonPrimitive?.content == "true" &&
-                            it.metadata["alert.channels.discord"]?.jsonPrimitive?.content == "false"
+                            it.metadata["alert.channels.discord"]?.jsonPrimitive?.content == "false" &&
+                            it.metadata["alert.display_title"]?.jsonPrimitive?.content == "High Error Rate" &&
+                            it.metadata["alert.current_value"]?.jsonPrimitive?.content == "50.00"
                     }
                 )
             }
@@ -857,10 +912,10 @@ class DashboardAlertServiceTest {
                 incidentService.autoResolveAlert(
                     organizationId = ORG_ID.toInt(),
                     source = AlertSource.DASHBOARD_ALERT,
-                    deduplicationKey = "moneat-dashboard-alert-${created.id}",
+                    deduplicationKey = "moneat-dashboard-alert-$numericAlertId",
                     title = "Dashboard Alert Resolved: High Error Rate",
                     description = "Test Widget on Test Dashboard recovered. Current value: 50.00",
-                    moneatUrl = "https://moneat.io/dashboards/$dashboardId",
+                    moneatUrl = "https://moneat.io/dashboards/$dashboardPublicId",
                     publishWorkflow = false,
                 )
             }
@@ -876,7 +931,7 @@ class DashboardAlertServiceTest {
                 retentionPolicyService.getRetentionDaysForProject(any())
             } returns RECOVERY_RETENTION_DAYS
             coEvery {
-                queryEngine.executeQuery(any(), any(), any(), any())
+                queryEngine.executeQuery(any(), any(), any(), any(), any())
             } returns listOf(mapOf("total" to JsonPrimitive(90.0)))
 
             val dashboardId = seedDashboard()
@@ -895,7 +950,7 @@ class DashboardAlertServiceTest {
                         AlertRequestOverrides(
                             threshold = 100.0,
                             warningThreshold = 80.0,
-                            incidentSeverity = "CRITICAL",
+                            alertPriority = "CRITICAL",
                         ),
                     ),
                 )
@@ -908,9 +963,11 @@ class DashboardAlertServiceTest {
             coVerify(exactly = 1) {
                 workflowService.publishAlertTriggered(
                     match {
-                        it.severity == AlertSeverity.LOW &&
+                        it.priority == AlertPriority.P3 &&
                             it.title == "Dashboard Warning: High Error Rate" &&
-                            it.source == AlertSource.DASHBOARD_ALERT
+                            it.source == AlertSource.DASHBOARD_ALERT &&
+                            it.metadata["alert.display_title"]?.jsonPrimitive?.content == "High Error Rate" &&
+                            it.metadata["alert.dashboard.title"]?.jsonPrimitive?.content == "Test Dashboard"
                     }
                 )
             }
@@ -926,7 +983,7 @@ class DashboardAlertServiceTest {
                 retentionPolicyService.getRetentionDaysForProject(any())
             } returns RECOVERY_RETENTION_DAYS
             coEvery {
-                queryEngine.executeQuery(any(), any(), any(), any())
+                queryEngine.executeQuery(any(), any(), any(), any(), any())
             } returns listOf(mapOf("total" to JsonPrimitive(125.0)))
 
             val dashboardId = seedDashboard()
@@ -945,7 +1002,7 @@ class DashboardAlertServiceTest {
                         AlertRequestOverrides(
                             threshold = 100.0,
                             warningThreshold = 80.0,
-                            incidentSeverity = "HIGH",
+                            alertPriority = "HIGH",
                             notificationChannels = NotificationChannels(email = false, slack = false, discord = false),
                         ),
                     ),
@@ -959,7 +1016,7 @@ class DashboardAlertServiceTest {
             coVerify(exactly = 1) {
                 incidentService.fireAlert(
                     match {
-                        it.severity == AlertSeverity.HIGH &&
+                        it.priority == AlertPriority.P1 &&
                             it.title == "Dashboard Error: High Error Rate"
                     },
                     publishWorkflow = false,
@@ -986,7 +1043,7 @@ class DashboardAlertServiceTest {
                 retentionPolicyService.getRetentionDaysForProject(any())
             } returns RECOVERY_RETENTION_DAYS
             coEvery {
-                queryEngine.executeQuery(any(), any(), any(), any())
+                queryEngine.executeQuery(any(), any(), any(), any(), any())
             } returns listOf(mapOf("total" to JsonPrimitive(90.0)))
 
             val dashboardId = seedDashboard()
@@ -1028,7 +1085,7 @@ class DashboardAlertServiceTest {
                 retentionPolicyService.getRetentionDaysForProject(any())
             } returns RECOVERY_RETENTION_DAYS
             coEvery {
-                queryEngine.executeQuery(any(), any(), any(), any())
+                queryEngine.executeQuery(any(), any(), any(), any(), any())
             } returns listOf(mapOf("total" to JsonPrimitive(90.0)))
 
             val dashboardId = seedDashboard()
@@ -1067,7 +1124,7 @@ class DashboardAlertServiceTest {
                 retentionPolicyService.getRetentionDaysForProject(any())
             } returns RECOVERY_RETENTION_DAYS
             coEvery {
-                queryEngine.executeQuery(any(), any(), any(), any())
+                queryEngine.executeQuery(any(), any(), any(), any(), any())
             } returns listOf(mapOf("total" to JsonPrimitive(70.0)))
 
             val dashboardId = seedDashboard()
@@ -1113,7 +1170,7 @@ class DashboardAlertServiceTest {
 
             callPrivateSuspend("evaluateAlerts")
 
-            coVerify(exactly = 0) { queryEngine.executeQuery(any(), any(), any(), any()) }
+            coVerify(exactly = 0) { queryEngine.executeQuery(any(), any(), any(), any(), any()) }
         }
 
     @Test
@@ -1126,7 +1183,7 @@ class DashboardAlertServiceTest {
                 retentionPolicyService.getRetentionDaysForProject(any())
             } returns RECOVERY_RETENTION_DAYS
             coEvery {
-                queryEngine.executeQuery(any(), any(), any(), any())
+                queryEngine.executeQuery(any(), any(), any(), any(), any())
             } throws RuntimeException("query failed")
 
             val dashboardId = seedDashboard()
@@ -1154,7 +1211,7 @@ class DashboardAlertServiceTest {
     fun `executeQueryForAlert executes custom datasource query without project`() =
         runBlocking {
             val source = customDataSource(id = 10)
-            every { dataSourceService.getDataSource(10, ORG_ID) } returns source
+            every { dataSourceService.getDataSource(source.id, ORG_ID) } returns source
             every { dataSourceService.getDecryptedCredentials(10, ORG_ID) } returns DataSourceCredentials()
             coEvery {
                 dataSourceExecutor.executeQuery(
@@ -1174,7 +1231,7 @@ class DashboardAlertServiceTest {
                 orgId = ORG_ID,
                 projectId = null,
                 queryDsl = QueryDsl(
-                    dataSource = "custom:10",
+                    dataSource = "custom:${source.id}",
                     rawQuery = "up",
                     limit = 25,
                 ),
@@ -1226,7 +1283,7 @@ class DashboardAlertServiceTest {
 
             assertTrue(result.isEmpty())
             coVerify(exactly = 0) {
-                queryEngine.executeQuery(any(), any(), any(), any())
+                queryEngine.executeQuery(any(), any(), any(), any(), any())
             }
         }
 
@@ -1239,7 +1296,7 @@ class DashboardAlertServiceTest {
                 retentionPolicyService.getRetentionDaysForProject(DEFAULT_PROJECT_ID)
             } returns null
             coEvery {
-                queryEngine.executeQuery(query, DEFAULT_PROJECT_ID, null, RECOVERY_RETENTION_DAYS)
+                queryEngine.executeQuery(query, DEFAULT_PROJECT_ID, null, RECOVERY_RETENTION_DAYS, ORG_ID)
             } returns rows
 
             val result = service.executeQueryForAlert(
@@ -1324,14 +1381,15 @@ class DashboardAlertServiceTest {
     @Test
     fun `executeQueryForAlert rejects missing custom datasource`() =
         runBlocking {
-            every { dataSourceService.getDataSource(404, ORG_ID) } returns null
+            val sourceId = customDataSourceResourceId(404)
+            every { dataSourceService.getDataSource(sourceId, ORG_ID) } returns null
 
             assertFailsWith<IllegalStateException> {
                 service.executeQueryForAlert(
                     orgId = ORG_ID,
                     projectId = null,
                     queryDsl = QueryDsl(
-                        dataSource = "custom:404",
+                        dataSource = "custom:$sourceId",
                         rawQuery = "up",
                     ),
                 )
@@ -1341,17 +1399,18 @@ class DashboardAlertServiceTest {
     @Test
     fun `executeQueryForAlert rejects disabled custom datasource`() =
         runBlocking {
-            every { dataSourceService.getDataSource(10, ORG_ID) } returns customDataSource(
+            val source = customDataSource(
                 id = 10,
                 enabled = false,
             )
+            every { dataSourceService.getDataSource(source.id, ORG_ID) } returns source
 
             assertFailsWith<IllegalStateException> {
                 service.executeQueryForAlert(
                     orgId = ORG_ID,
                     projectId = null,
                     queryDsl = QueryDsl(
-                        dataSource = "custom:10",
+                        dataSource = "custom:${source.id}",
                         rawQuery = "up",
                     ),
                 )
@@ -1361,13 +1420,14 @@ class DashboardAlertServiceTest {
     @Test
     fun `executeQueryForAlert rejects custom datasource query without raw query`() =
         runBlocking {
-            every { dataSourceService.getDataSource(10, ORG_ID) } returns customDataSource(id = 10)
+            val source = customDataSource(id = 10)
+            every { dataSourceService.getDataSource(source.id, ORG_ID) } returns source
 
             assertFailsWith<IllegalArgumentException> {
                 service.executeQueryForAlert(
                     orgId = ORG_ID,
                     projectId = null,
-                    queryDsl = QueryDsl(dataSource = "custom:10"),
+                    queryDsl = QueryDsl(dataSource = "custom:${source.id}"),
                 )
             }
         }
@@ -1375,14 +1435,15 @@ class DashboardAlertServiceTest {
     @Test
     fun `executeQueryForAlert rejects custom datasource query with blank raw query`() =
         runBlocking {
-            every { dataSourceService.getDataSource(10, ORG_ID) } returns customDataSource(id = 10)
+            val source = customDataSource(id = 10)
+            every { dataSourceService.getDataSource(source.id, ORG_ID) } returns source
 
             assertFailsWith<IllegalArgumentException> {
                 service.executeQueryForAlert(
                     orgId = ORG_ID,
                     projectId = null,
                     queryDsl = QueryDsl(
-                        dataSource = "custom:10",
+                        dataSource = "custom:${source.id}",
                         rawQuery = "   ",
                     ),
                 )
@@ -1392,17 +1453,18 @@ class DashboardAlertServiceTest {
     @Test
     fun `executeQueryForAlert rejects unsupported custom datasource type`() =
         runBlocking {
-            every { dataSourceService.getDataSource(10, ORG_ID) } returns customDataSource(
+            val source = customDataSource(
                 id = 10,
                 sourceType = "unsupported",
             )
+            every { dataSourceService.getDataSource(source.id, ORG_ID) } returns source
 
             assertFailsWith<IllegalStateException> {
                 service.executeQueryForAlert(
                     orgId = ORG_ID,
                     projectId = null,
                     queryDsl = QueryDsl(
-                        dataSource = "custom:10",
+                        dataSource = "custom:${source.id}",
                         rawQuery = "up",
                     ),
                 )
@@ -1412,10 +1474,11 @@ class DashboardAlertServiceTest {
     @Test
     fun `executeQueryForAlert rejects missing credentials for credentialed datasource`() =
         runBlocking {
-            every { dataSourceService.getDataSource(10, ORG_ID) } returns customDataSource(
+            val source = customDataSource(
                 id = 10,
                 hasCredentials = true,
             )
+            every { dataSourceService.getDataSource(source.id, ORG_ID) } returns source
             every { dataSourceService.getDecryptedCredentials(10, ORG_ID) } returns null
 
             assertFailsWith<IllegalStateException> {
@@ -1423,7 +1486,7 @@ class DashboardAlertServiceTest {
                     orgId = ORG_ID,
                     projectId = null,
                     queryDsl = QueryDsl(
-                        dataSource = "custom:10",
+                        dataSource = "custom:${source.id}",
                         rawQuery = "up",
                     ),
                 )
@@ -1435,7 +1498,7 @@ class DashboardAlertServiceTest {
         runBlocking {
             val source = customDataSource(id = 10, hasCredentials = true)
             val credentials = DataSourceCredentials(apiKey = "secret")
-            every { dataSourceService.getDataSource(10, ORG_ID) } returns source
+            every { dataSourceService.getDataSource(source.id, ORG_ID) } returns source
             every { dataSourceService.getDecryptedCredentials(10, ORG_ID) } returns credentials
             coEvery {
                 dataSourceExecutor.executeQuery(
@@ -1455,7 +1518,7 @@ class DashboardAlertServiceTest {
                 orgId = ORG_ID,
                 projectId = null,
                 queryDsl = QueryDsl(
-                    dataSource = "custom:10",
+                    dataSource = "custom:${source.id}",
                     rawQuery = "up",
                 ),
             )
@@ -1473,7 +1536,7 @@ class DashboardAlertServiceTest {
                     "value" to JsonPrimitive(0.25),
                 )
             ),
-            QueryDsl(dataSource = "custom:10"),
+            QueryDsl(dataSource = "custom:${customDataSourceResourceId(10)}"),
             0,
         )
 
@@ -1486,7 +1549,7 @@ class DashboardAlertServiceTest {
             "extractMetricValue",
             listOf(mapOf("cpu_avg" to JsonPrimitive(0.5))),
             QueryDsl(
-                dataSource = "custom:10",
+                dataSource = "custom:${customDataSourceResourceId(10)}",
                 metrics = listOf(MetricDef(AggFunction.AVG, field = "cpu", alias = "cpu_avg")),
             ),
             0,
@@ -1506,7 +1569,7 @@ class DashboardAlertServiceTest {
                     "host" to JsonPrimitive("api-1"),
                 ),
             ),
-            QueryDsl(dataSource = "custom:10"),
+            QueryDsl(dataSource = "custom:${customDataSourceResourceId(10)}"),
             0,
         )
 

@@ -18,6 +18,11 @@ package com.moneat.notifications.services
 
 import com.moneat.config.ClickHouseClient
 import com.moneat.events.models.SentryEvent
+import com.moneat.alerts.models.AlertSource
+import com.moneat.alerts.models.AlertLifecycleEvent
+import com.moneat.alerts.models.AlertPriority
+import com.moneat.alerts.models.AlertStatus
+import com.moneat.monitoring.OperationalMetrics
 import com.moneat.shared.models.Memberships
 import com.moneat.shared.models.NotificationPreferences
 import com.moneat.shared.models.Projects
@@ -68,6 +73,7 @@ private const val WEEKLY_SUMMARY_HOUR = 9
 private const val FULL_PERCENTAGE = 100
 private const val MILLION = 1_000_000L
 private const val THOUSAND = 1_000L
+private const val WEEKLY_SUMMARY_JOB_NAME = "weekly_summary"
 
 class NotificationService(
     private val emailService: EmailService,
@@ -298,7 +304,8 @@ class NotificationService(
     }
 
     suspend fun sendWeeklySummary() {
-        suspendRunCatching {
+        val startedAt = Instant.now()
+        val result = suspendRunCatching {
             logger.info { "Starting weekly summary generation" }
 
             val now = Instant.now()
@@ -346,9 +353,24 @@ class NotificationService(
                     " $skippedCount skipped, $failedCount failed" +
                     " out of ${usersToNotify.size} users"
             }
-        }.getOrElse { e ->
+            if (failedCount > 0) {
+                logger.error {
+                    "Weekly summary failed to send to $failedCount users" +
+                        " out of ${usersToNotify.size} eligible users"
+                }
+            }
+            failedCount == 0
+        }
+
+        result.onFailure { e ->
             logger.error(e) { "Error in sendWeeklySummary" }
         }
+        OperationalMetrics.recordBackgroundJobRun(
+            WEEKLY_SUMMARY_JOB_NAME,
+            result.getOrDefault(false),
+            Duration.between(startedAt, Instant.now()).toMillis().toDouble() / EPOCH_SECONDS_TO_MILLIS,
+            result.exceptionOrNull()
+        )
     }
 
     suspend fun sendWeeklySummaryForUser(
@@ -394,7 +416,7 @@ class NotificationService(
         val priorStats = getStatsForPeriod(projectIds, priorStartDate, startDate)
 
         if (currentStats == null) {
-            logger.warn { "Skipping weekly summary for $email: ClickHouse stats query failed" }
+            logger.error { "Weekly summary failed to send to $email: ClickHouse stats query failed" }
             return WeeklySummaryResult.FAILED
         }
 
@@ -413,16 +435,16 @@ class NotificationService(
 
         val topIssues = getTopIssues(projectIds, startDate, endDate, limit = 5)
         if (topIssues == null) {
-            logger.warn {
-                "Skipping weekly summary for $email: ClickHouse top issues query failed"
+            logger.error {
+                "Weekly summary failed to send to $email: ClickHouse top issues query failed"
             }
             return WeeklySummaryResult.FAILED
         }
 
         val perProjectStats = getPerProjectStats(projectIds, startDate, endDate)
         if (perProjectStats == null) {
-            logger.warn {
-                "Skipping weekly summary for $email: ClickHouse per-project stats query failed"
+            logger.error {
+                "Weekly summary failed to send to $email: ClickHouse per-project stats query failed"
             }
             return WeeklySummaryResult.FAILED
         }
@@ -603,7 +625,7 @@ class NotificationService(
                 issue_id,
                 any(message) as title,
                 any(exception_type) as culprit,
-                any(project_id) as project_id,
+                any(project_id) as top_issue_project_id,
                 count() as event_count
             FROM `$clickhouseDb`.events
             WHERE project_id IN (${projectIds.joinToString(",")})
@@ -637,7 +659,7 @@ class NotificationService(
 
         return rows.mapNotNull { row ->
             val obj = row.jsonObject
-            val projectId = obj["project_id"]?.jsonPrimitive?.longOrNull ?: return@mapNotNull null
+            val projectId = obj["top_issue_project_id"]?.jsonPrimitive?.longOrNull ?: return@mapNotNull null
             EmailService.TopIssue(
                 title = obj["title"]?.jsonPrimitive?.contentOrNull ?: "Unknown error",
                 culprit = obj["culprit"]?.jsonPrimitive?.contentOrNull ?: "unknown",
@@ -756,6 +778,15 @@ class NotificationService(
     private fun formatDate(instant: Instant): String {
         val formatter = DateTimeFormatter.ofPattern("MMM dd, yyyy", Locale.US)
         return formatter.format(instant.atZone(ZoneId.of("UTC")))
+    }
+
+    private fun priorityForIssueLevel(level: String): AlertPriority {
+        return when (level.lowercase(Locale.getDefault())) {
+            "fatal" -> AlertPriority.P0
+            "error" -> AlertPriority.P1
+            "warning" -> AlertPriority.P2
+            else -> AlertPriority.P3
+        }
     }
 
     fun shutdown() {

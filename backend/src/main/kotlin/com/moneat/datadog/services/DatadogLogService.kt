@@ -18,6 +18,8 @@ package com.moneat.datadog.services
 
 import com.moneat.config.RedisConfig
 import com.moneat.datadog.models.DatadogLogEntry
+import com.moneat.logs.services.LogLineClassification
+import com.moneat.logs.services.LogLineClassifier
 import com.moneat.logs.models.QueuedLogBatch
 import com.moneat.logs.models.QueuedLogEntry
 import kotlinx.serialization.json.Json
@@ -26,22 +28,11 @@ import java.util.UUID
 
 private val logger = KotlinLogging.logger {}
 private const val LOG_QUEUE_KEY = "moneat:logs:queue"
-
-private val ddStatusToLevel = mapOf(
-    "debug" to "debug",
-    "info" to "info",
-    "informational" to "info",
-    "notice" to "info",
-    "warn" to "warn",
-    "warning" to "warn",
-    "error" to "error",
-    "err" to "error",
-    "critical" to "fatal",
-    "crit" to "fatal",
-    "alert" to "fatal",
-    "emergency" to "fatal",
-    "emerg" to "fatal"
-)
+private const val DEFAULT_LOG_LEVEL = "info"
+private const val TAG_CATEGORY = "category"
+private const val TAG_DD_SOURCE = "ddsource"
+private const val TAG_VERSION = "version"
+private const val RESOURCE_SERVICE_VERSION = "service.version"
 
 object DatadogLogService {
 
@@ -57,17 +48,19 @@ object DatadogLogService {
         val logs = entries.map { entry ->
             val tags = parseDdTags(entry.ddtags).toMutableMap()
             if (entry.ddsource.isNotBlank()) {
-                tags["ddsource"] = entry.ddsource
+                tags[TAG_DD_SOURCE] = entry.ddsource
             }
+            val classification = LogLineClassifier.classify(entry.message)
+            addClassificationTags(tags, classification)
+            val resourceAttributes = serviceVersionResourceAttributes(tags)
 
             QueuedLogEntry(
                 logId = UUID.randomUUID().toString(),
                 timestampMs = entry.timestamp
                     ?: System.currentTimeMillis(),
-                level = ddStatusToLevel[entry.status.lowercase()]
-                    ?: "info",
-                message = entry.message,
-                body = "",
+                level = resolveLogLevel(entry.status, classification.level),
+                message = classification.message,
+                body = classification.body.orEmpty(),
                 service = entry.service,
                 environment = tags.remove("env") ?: "",
                 host = entry.hostname,
@@ -77,7 +70,8 @@ object DatadogLogService {
                 containerImage = "",
                 traceId = "",
                 spanId = "",
-                tags = tags
+                tags = tags,
+                resourceAttributes = resourceAttributes
             )
         }
 
@@ -123,5 +117,34 @@ object DatadogLogService {
             }
         }
         return tags
+    }
+
+    private fun resolveLogLevel(
+        status: String,
+        classifiedLevel: String?
+    ): String {
+        val envelopeLevel = LogLineClassifier.normalizeLevel(status) ?: DEFAULT_LOG_LEVEL
+        return LogLineClassifier.resolveLevel(envelopeLevel, classifiedLevel)
+    }
+
+    private fun addClassificationTags(
+        tags: MutableMap<String, String>,
+        classification: LogLineClassification
+    ) {
+        classification.tags.forEach { (key, value) ->
+            if (key == TAG_CATEGORY) {
+                tags.putIfAbsent(key, value)
+            } else {
+                tags[key] = value
+            }
+        }
+    }
+
+    private fun serviceVersionResourceAttributes(tags: Map<String, String>): Map<String, String> {
+        val serviceVersion = tags[RESOURCE_SERVICE_VERSION]
+            ?.takeIf { it.isNotBlank() }
+            ?: tags[TAG_VERSION]?.takeIf { it.isNotBlank() }
+
+        return serviceVersion?.let { mapOf(RESOURCE_SERVICE_VERSION to it) } ?: emptyMap()
     }
 }

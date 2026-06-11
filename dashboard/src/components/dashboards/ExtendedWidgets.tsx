@@ -34,7 +34,8 @@ import type {GeometryCollection, Topology} from 'topojson-specification'
 import countriesTopology from 'world-atlas/countries-110m.json'
 import type {DashboardWidget} from '@/lib/api'
 import {formatValue} from './formatValue'
-import {extendedWidgetTestId} from './extendedWidgetTypes'
+import {extendedWidgetTestId, isOverviewWidgetType} from './extendedWidgetTypes'
+import {overviewWidgetDef} from '@/components/overview/overviewWidgetTypes'
 
 const COLORS = [
   'hsl(var(--chart-1))',
@@ -136,6 +137,14 @@ export const ExtendedWidgetRenderer = memo(function ExtendedWidgetRenderer({
   data,
   displayConfig,
 }: ExtendedWidgetRendererProps) {
+  // Native overview widgets render from their own data hooks (no query).
+  if (isOverviewWidgetType(widgetType)) {
+    const def = overviewWidgetDef(widgetType)
+    if (def) {
+      const OverviewWidget = def.component
+      return <OverviewWidget displayConfig={displayConfig} />
+    }
+  }
   switch (widgetType) {
     case 'stream':
       return <StreamWidget data={data} />
@@ -604,7 +613,7 @@ const SankeyWidget = memo(function SankeyWidget({data}: {data: DataRow[]}) {
             <div className="truncate text-right text-[11px] text-muted-foreground">{edge.source}</div>
             <div className="relative h-5 rounded bg-muted/30">
               <div
-                className="h-full rounded shadow-sm"
+                className="h-full rounded"
                 style={{
                   width: `${Math.max(8, Math.abs(edge.value) / maxValue * 100)}%`,
                   backgroundColor: COLORS[index % COLORS.length],
@@ -613,8 +622,7 @@ const SankeyWidget = memo(function SankeyWidget({data}: {data: DataRow[]}) {
               <div className="absolute inset-0 flex items-center justify-center">
                 <span
                   className={
-                    'rounded bg-background/90 px-1.5 text-[11px] font-semibold ' +
-                    'tabular-nums text-foreground shadow-sm'
+                    'rounded bg-background/90 px-1.5 text-[11px] font-semibold tabular-nums text-foreground'
                   }
                 >
                   {compactNumber(edge.value)}
@@ -648,14 +656,13 @@ const TreemapWidget = memo(function TreemapWidget({data}: {data: DataRow[]}) {
             }}
           >
             <div
-              className="max-w-full rounded bg-background/90 px-1.5 py-1 text-xs font-medium text-foreground shadow-sm"
+              className="max-w-full rounded bg-background/90 px-1.5 py-1 text-xs font-medium text-foreground"
             >
               <div className="truncate">{item.label}</div>
             </div>
             <div
               className={
-                'mt-2 w-fit rounded bg-background/90 px-1.5 py-0.5 text-sm font-semibold ' +
-                'tabular-nums text-foreground shadow-sm'
+                'mt-2 w-fit rounded bg-background/90 px-1.5 py-0.5 text-sm font-semibold tabular-nums text-foreground'
               }
             >
               {compactNumber(item.value)}
@@ -781,7 +788,7 @@ function ScatterTooltip({
   if (!active || !point) return null
 
   return (
-    <div style={TOOLTIP_STYLE} className="space-y-1 px-2 py-1.5 shadow-sm">
+    <div style={TOOLTIP_STYLE} className="space-y-1 px-2 py-1.5">
       <div className="flex items-center gap-1.5 font-medium text-foreground">
         <span className="h-2 w-2 rounded-full" style={{backgroundColor: point.color}} />
         <span>{point.label}</span>

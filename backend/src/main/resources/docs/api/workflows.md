@@ -37,6 +37,36 @@ Create a workflow.
 | steps | array | no | Step configuration |
 | once_for_template | array | no | Scope references used to build the idempotency key |
 
+### POST /v1/workflows/preview
+
+Render workflow notification messages without sending them.
+
+**Body:**
+
+| name | type | required | description |
+|------|------|----------|-------------|
+| trigger_name | string | yes | Trigger name from the catalog |
+| steps | array | yes | Step configuration to preview |
+| scope | object | no | Scope values that override the representative sample alert |
+
+The response includes the sample scope and one preview item per notification step. Preview items include
+channel, title or subject, text body, optional HTML body, fields, status color, CTA label, and CTA URL.
+
+### POST /v1/workflows/test-message
+
+Send representative workflow notification messages to the configured integrations without creating a workflow run.
+
+**Body:**
+
+| name | type | required | description |
+|------|------|----------|-------------|
+| trigger_name | string | yes | Trigger name from the catalog |
+| steps | array | yes | Step configuration to send |
+| scope | object | no | Scope values that override the representative sample alert |
+
+The response includes the sample scope and one send result per notification step. Result statuses are
+`sent`, `failed`, or `skipped`.
+
 ### GET /v1/workflows/{workflowId}
 
 Get a workflow by ID.
@@ -61,12 +91,37 @@ List recent runs for a workflow.
 |------|------|---------|-------------|
 | limit | integer | 50 | Number of runs to return. Values are clamped from 1 to 100. |
 
+### GET /v1/alerts/lifecycles
+
+List alert episodes for the current organization.
+
+**Query parameters:**
+
+| name | type | default | description |
+|------|------|---------|-------------|
+| status | string | all | Optional episode status, such as `FIRING` or `RESOLVED`. |
+| limit | integer | 50 | Number of episodes to return. Values are clamped from 1 to 100. |
+
+### POST /v1/alerts/lifecycles/{episodeId}/ignore
+
+Suppress notifications for the current open alert episode.
+
+**Body:**
+
+| name | type | required | description |
+|------|------|----------|-------------|
+| reason | string | no | Optional suppress reason. |
+
+### POST /v1/alerts/lifecycles/{episodeId}/unignore
+
+Resume notifications for an alert episode.
+
 ## Supported triggers
 
 | name | description |
 |------|-------------|
 | alert.triggered | Runs when Moneat fires an alert lifecycle event. |
-| alert.resolved | Runs when Moneat resolves an alert by deduplication key. |
+| alert.resolved | Runs when Moneat resolves an alert episode. |
 
 ## Supported steps
 
@@ -84,10 +139,24 @@ Step parameters support double-brace interpolation with trigger scope references
 
 ```text
 {{alert.title}}
-{{alert.severity}}
+{{alert.display_title}}
+{{alert.priority}}
 {{alert.url}}
 ```
 
+`alert.priority` renders the alert priority (`P0` through `P5`) used in notification routing.
+
+Dashboard alert events also expose dashboard-specific fields such as `alert.dashboard.title`,
+`alert.widget.title`, `alert.condition`, `alert.threshold`, and `alert.current_value`.
+
 ## Run identity
 
-`once_for_template` is evaluated against the trigger scope to build `workflow_runs.once_for`. Moneat enforces one run per workflow and `once_for` value, which prevents repeated notification loops for the same alert.
+`once_for_template` is evaluated against the trigger scope to build `workflow_runs.once_for`. Moneat
+enforces one run per workflow and `once_for` value, which prevents repeated notification loops.
+
+Firing alert workflows default to `alert.episode_key` and `alert.notification_sequence`, so each
+new alert episode can notify again and long-running episodes can send daily reminders. Resolved alert
+workflows default to `alert.episode_key` and `alert.status`.
+
+`alert.deduplication_key` remains the stable key for the underlying alert condition. Do not use it
+alone as an alert workflow run identity unless repeat episodes should intentionally be suppressed.

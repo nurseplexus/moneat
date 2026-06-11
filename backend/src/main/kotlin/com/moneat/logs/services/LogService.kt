@@ -26,11 +26,14 @@ import com.moneat.config.isClickHouseError
 import com.moneat.logs.models.AgentLogEntry
 import com.moneat.logs.models.LogAggregateBucket
 import com.moneat.logs.models.LogAggregateResponse
+import com.moneat.logs.models.LogAnalyticsFilters
 import com.moneat.logs.models.LogEntryResponse
 import com.moneat.logs.models.LogFilterOptionWithCount
 import com.moneat.logs.models.LogFilterOptionsResponse
 import com.moneat.logs.models.LogFilterOptionsWithCountsResponse
 import com.moneat.logs.models.LogIngestEntry
+import com.moneat.logs.models.LogPatternRequest
+import com.moneat.logs.models.LogPatternResponse
 import com.moneat.logs.models.LogQueryRequest
 import com.moneat.logs.models.LogQueryResponse
 import com.moneat.logs.models.LogTagValuesResponse
@@ -64,7 +67,8 @@ import mu.KotlinLogging
 import java.security.MessageDigest
 import java.time.Instant
 import com.moneat.utils.suspendRunCatching
-import java.util.*
+import java.util.Base64
+import java.util.UUID
 import kotlin.text.Charsets
 
 private val logger = KotlinLogging.logger {}
@@ -79,6 +83,23 @@ private val topLevelFields =
 private data class LogWithCursor(
     val log: LogEntryResponse,
     val timestampMs: Long
+)
+
+private data class LogQueryWhere(
+    val conditions: List<String>,
+    val parameters: Map<String, String>
+)
+
+private data class LogAnalyticsWhere(
+    val conditions: List<String>,
+    val parameters: Map<String, String>,
+    val fromMs: Long?,
+    val toMs: Long?
+)
+
+private data class AggregateParseResult(
+    val buckets: List<LogAggregateBucket>,
+    val totalCount: Long
 )
 
 private const val MAX_LOG_QUERY_LIMIT = 500
@@ -121,6 +142,7 @@ class LogService(private val logRepository: LogRepository) {
     private val json = Json { ignoreUnknownKeys = true }
     private val usageTracking = UsageTrackingService.instance
     private val queryParser = LogQueryParser()
+    private val patternQuery = LogPatternQuery(logRepository)
 
     fun liveChannel(organizationId: Long): String = "log:live:$organizationId"
 
@@ -192,6 +214,7 @@ class LogService(private val logRepository: LogRepository) {
                 toUUID('${escapeSql(entry.logId)}'),
                 ${batch.effectiveOrganizationId},
                 ${entry.projectId ?: 0L},
+                ${entry.projectId ?: 0L},
                 toUUID('${escapeSql(systemIdValue)}'),
                 fromUnixTimestamp64Milli(${entry.timestampMs}),
                 '${escapeSql(entry.level)}',
@@ -218,6 +241,7 @@ class LogService(private val logRepository: LogRepository) {
             INSERT INTO `$clickhouseDb`.logs (
                 log_id,
                 organization_id,
+                service_id,
                 project_id,
                 system_id,
                 timestamp,
@@ -279,133 +303,89 @@ class LogService(private val logRepository: LogRepository) {
     fun matchesTailFilters(
         log: LogEntryResponse,
         filters: LogTailFilters
+    ): Boolean =
+        matchesIncludedTailFilters(log, filters) &&
+            matchesExcludedTailFilters(log, filters) &&
+            matchesTailTagFilters(log, filters) &&
+            matchesTailQueryFilter(log, filters)
+
+    private fun matchesIncludedTailFilters(
+        log: LogEntryResponse,
+        filters: LogTailFilters
     ): Boolean {
         if (filters.levels.isNotEmpty() && log.level.lowercase() !in filters.levels) {
             return false
         }
-        if (!filters.service.isNullOrBlank() && !log.service.equals(filters.service, ignoreCase = true)) {
+        if (!matchesOptionalIgnoreCase(log.service, filters.service)) {
             return false
         }
-        if (!filters.environment.isNullOrBlank() && !log.environment.equals(filters.environment, ignoreCase = true)) {
+        if (!matchesOptionalIgnoreCase(log.environment, filters.environment)) {
             return false
         }
-        if (!filters.query.isNullOrBlank()) {
-            val query = filters.query.lowercase()
-            val haystack = "${log.message}\n${log.body}".lowercase()
-            if (!haystack.contains(query)) {
-                return false
-            }
+        if (!matchesOptionalIgnoreCase(log.containerName, filters.containerName)) {
+            return false
         }
         return true
     }
+
+    private fun matchesExcludedTailFilters(
+        log: LogEntryResponse,
+        filters: LogTailFilters
+    ): Boolean {
+        if (matchesExcludedIgnoreCase(log.service, filters.excludeService)) {
+            return false
+        }
+        if (matchesExcludedIgnoreCase(log.environment, filters.excludeEnvironment)) {
+            return false
+        }
+        if (matchesExcludedIgnoreCase(log.containerName, filters.excludeContainerName)) {
+            return false
+        }
+        return true
+    }
+
+    private fun matchesTailTagFilters(
+        log: LogEntryResponse,
+        filters: LogTailFilters
+    ): Boolean {
+        if (filters.tags.any { (key, value) -> log.tags[key] != value }) {
+            return false
+        }
+        if (filters.excludeTags.any { (key, value) -> log.tags[key] == value }) {
+            return false
+        }
+        return true
+    }
+
+    private fun matchesTailQueryFilter(
+        log: LogEntryResponse,
+        filters: LogTailFilters
+    ): Boolean {
+        if (filters.query.isNullOrBlank()) return true
+        val query = filters.query.lowercase()
+        val haystack = "${log.message}\n${log.body}".lowercase()
+        return haystack.contains(query)
+    }
+
+    private fun matchesOptionalIgnoreCase(actual: String, expected: String?): Boolean =
+        expected.isNullOrBlank() || actual.lowercase() == expected.lowercase()
+
+    private fun matchesExcludedIgnoreCase(actual: String, excluded: String?): Boolean =
+        !excluded.isNullOrBlank() && actual.lowercase() == excluded.lowercase()
 
     suspend fun queryLogs(
         organizationId: Long,
         request: LogQueryRequest
     ): LogQueryResponse {
         val limit = request.limit.coerceIn(1, MAX_LOG_QUERY_LIMIT)
-        val conditions = mutableListOf<String>()
+        val where = buildLogQueryConditions(organizationId, request) ?: return LogQueryResponse(
+            logs = emptyList(),
+            nextCursor = null,
+            hasMore = false,
+            totalCount = 0L
+        )
 
-        val totalCountFilter =
-            buildScopeFilter(organizationId, request.systemId, request.hostId) ?: return LogQueryResponse(
-                logs = emptyList(),
-                nextCursor = null,
-                hasMore = false,
-                totalCount = 0L
-            )
-
-        // Support filtering by either system_id or organization_id
-        conditions += totalCountFilter
-
-        val fromMs = parseTimeToMillis(request.from)
-        if (fromMs != null) {
-            conditions += "timestamp >= fromUnixTimestamp64Milli($fromMs)"
-        }
-
-        val toMs = parseTimeToMillis(request.to)
-        if (toMs != null) {
-            conditions += "timestamp <= fromUnixTimestamp64Milli($toMs)"
-        }
-
-        if (!request.service.isNullOrBlank()) {
-            conditions += "service = '${escapeSql(request.service)}'"
-        }
-
-        if (!request.environment.isNullOrBlank()) {
-            conditions += "environment = '${escapeSql(request.environment)}'"
-        }
-
-        if (!request.containerName.isNullOrBlank()) {
-            conditions += "container_name = '${escapeSql(request.containerName)}'"
-        }
-
-        val normalizedLevels =
-            request.levels
-                .map { normalizeLevel(it) }
-                .filter { it.isNotBlank() }
-                .distinct()
-        if (normalizedLevels.isNotEmpty()) {
-            val inClause = normalizedLevels.joinToString(",") { "'${escapeSql(it)}'" }
-            conditions += "level IN ($inClause)"
-        }
-
-        if (!request.query.isNullOrBlank()) {
-            // Use Datadog-compatible query parser
-            suspendRunCatching {
-                val parsed = queryParser.parse(request.query)
-                if (parsed.rootNode != null) {
-                    val queryCondition = queryParser.toClickHouseSql(parsed.rootNode, ::escapeSql)
-                    if (queryCondition.isNotBlank() && queryCondition != "1=1") {
-                        logger.info { "Generated query condition from '${request.query}': $queryCondition" }
-                        conditions += "($queryCondition)"
-                    }
-                }
-            }.getOrElse { e ->
-                val q = request.query.orEmpty()
-                logger.error(e) {
-                    "Failed to parse query (query_fp=${utf8Fingerprint(q)}), falling back to simple search"
-                }
-                // Fallback: treat as simple full-text search
-                conditions += buildSimpleSearchCondition(request.query)
-            }
-        }
-
-        request.tags.forEach { (key, value) ->
-            val condition = buildTagCondition(key, value)
-            if (condition.isNotBlank()) {
-                conditions += condition
-            }
-        }
-
-        // Add exclude filters
-        if (!request.excludeService.isNullOrBlank()) {
-            conditions += "service != '${escapeSql(request.excludeService)}'"
-        }
-
-        if (!request.excludeEnvironment.isNullOrBlank()) {
-            conditions += "environment != '${escapeSql(request.excludeEnvironment)}'"
-        }
-
-        if (!request.excludeContainerName.isNullOrBlank()) {
-            conditions += "container_name != '${escapeSql(request.excludeContainerName)}'"
-        }
-
-        request.excludeTags.forEach { (key, value) ->
-            val condition = buildTagCondition(key, value)
-            if (condition.isNotBlank()) {
-                // Negate the condition by wrapping in NOT
-                conditions += "NOT ($condition)"
-            }
-        }
-
-        decodeCursor(request.cursor)?.let { (cursorTs, cursorLogId) ->
-            conditions +=
-                "(timestamp < fromUnixTimestamp64Milli($cursorTs) OR " +
-                "(timestamp = fromUnixTimestamp64Milli($cursorTs) AND " +
-                "toString(log_id) < '${escapeSql(cursorLogId)}'))"
-        }
-
-        val whereClause = conditions.joinToString(" AND ")
+        val whereClause = where.conditions.joinToString(" AND ")
 
         logger.debug {
             "Executing log query: where_fp=${utf8Fingerprint(whereClause)} " +
@@ -439,7 +419,7 @@ class LogService(private val logRepository: LogRepository) {
             FORMAT JSONEachRow
             """.trimIndent()
 
-        val body = logRepository.executeClickHouseQuery(query)
+        val body = logRepository.executeClickHouseQuery(query, where.parameters)
         if (body.isClickHouseError()) {
             logger.error(
                 "ClickHouse query failed. where_fp=${utf8Fingerprint(whereClause)} " +
@@ -463,6 +443,160 @@ class LogService(private val logRepository: LogRepository) {
             totalCount = null
         )
     }
+
+    private suspend fun buildLogQueryConditions(
+        organizationId: Long,
+        request: LogQueryRequest
+    ): LogQueryWhere? {
+        val scopeFilter = buildScopeFilter(organizationId, request.systemId, request.hostId) ?: return null
+        val parameters = mutableMapOf<String, String>()
+        val conditions =
+            buildList {
+                add(scopeFilter)
+                addLogTimeFilters(request)
+                addLogIncludeFilters(request)
+                addLogQueryFilter(request.query)
+                addTagFilters(request.tags)
+                addLogMessagePatternFilter(request.messagePattern, parameters)
+                addLogTraceFilter(request.traceId)
+                addLogExcludeFilters(request)
+                addTagFilters(request.excludeTags, exclude = true)
+                addLogCursorFilter(request.cursor)
+            }
+        return LogQueryWhere(conditions = conditions, parameters = parameters)
+    }
+
+    private fun MutableList<String>.addLogTimeFilters(request: LogQueryRequest) {
+        parseTimeToMillis(request.from)?.let { fromMs ->
+            add("timestamp >= fromUnixTimestamp64Milli($fromMs)")
+        }
+        parseTimeToMillis(request.to)?.let { toMs ->
+            add("timestamp <= fromUnixTimestamp64Milli($toMs)")
+        }
+    }
+
+    private fun MutableList<String>.addLogIncludeFilters(request: LogQueryRequest) {
+        addIfPresent(request.service) { "service = '${escapeSql(it)}'" }
+        addIfPresent(request.environment) { "environment = '${escapeSql(it)}'" }
+        addIfPresent(request.host) { "host = '${escapeSql(it)}'" }
+        addIfPresent(request.containerName) { "container_name = '${escapeSql(it)}'" }
+        addLevelFilter(request.levels)
+    }
+
+    private suspend fun buildLogAnalyticsWhere(
+        organizationId: Long,
+        filters: LogAnalyticsFilters,
+        defaultToNow: Boolean = false
+    ): LogAnalyticsWhere {
+        val fromMs = parseTimeToMillis(filters.from)
+        val toMs = parseTimeToMillis(filters.to) ?: if (defaultToNow) System.currentTimeMillis() else null
+        val parameters = mutableMapOf<String, String>()
+        val conditions =
+            buildList {
+                add(ClickHouseQueryUtils.orgIdClause(organizationId))
+                fromMs?.let { add("timestamp >= fromUnixTimestamp64Milli($it)") }
+                toMs?.let { add("timestamp <= fromUnixTimestamp64Milli($it)") }
+                addLogIncludeFilters(filters)
+                addLogQueryFilter(filters.query)
+                addTagFilters(filters.tags)
+                addLogMessagePatternFilter(filters.messagePattern, parameters)
+                addLogTraceFilter(filters.traceId)
+                addLogExcludeFilters(filters)
+                addTagFilters(filters.excludeTags, exclude = true)
+            }
+        return LogAnalyticsWhere(conditions = conditions, parameters = parameters, fromMs = fromMs, toMs = toMs)
+    }
+
+    private fun MutableList<String>.addLogIncludeFilters(filters: LogAnalyticsFilters) {
+        addIfPresent(filters.service) { "service = '${escapeSql(it)}'" }
+        addIfPresent(filters.environment) { "environment = '${escapeSql(it)}'" }
+        addIfPresent(filters.host) { "host = '${escapeSql(it)}'" }
+        addLevelFilter(filters.levels)
+    }
+
+    private fun MutableList<String>.addLevelFilter(levels: List<String>) {
+        val normalizedLevels = levels.map { normalizeLevel(it) }.filter { it.isNotBlank() }.distinct()
+        if (normalizedLevels.isEmpty()) return
+
+        val inClause = normalizedLevels.joinToString(",") { "'${escapeSql(it)}'" }
+        add("level IN ($inClause)")
+    }
+
+    private suspend fun MutableList<String>.addLogQueryFilter(query: String?) {
+        if (query.isNullOrBlank()) return
+
+        suspendRunCatching {
+            queryParser.parse(query).rootNode?.let { rootNode ->
+                val queryCondition = queryParser.toClickHouseSql(rootNode, ::escapeSql)
+                if (queryCondition.isNotBlank() && queryCondition != "1=1") {
+                    logger.info { "Generated query condition from '$query': $queryCondition" }
+                    add("($queryCondition)")
+                }
+            }
+        }.getOrElse { e ->
+            logger.error(e) {
+                "Failed to parse query (query_fp=${utf8Fingerprint(query)}), falling back to simple search"
+            }
+            add(buildSimpleSearchCondition(query))
+        }
+    }
+
+    private fun MutableList<String>.addTagFilters(tags: Map<String, String>, exclude: Boolean = false) {
+        tags.forEach { (key, value) ->
+            val condition = buildTagCondition(key, value, exclude = exclude)
+            if (condition.isNotBlank()) {
+                add(condition)
+            }
+        }
+    }
+
+    private fun MutableList<String>.addLogMessagePatternFilter(
+        messagePattern: String?,
+        parameters: MutableMap<String, String>
+    ) {
+        val normalizedPattern = normalizeLogMessagePattern(messagePattern)
+        if (normalizedPattern.isBlank()) return
+
+        add(logMessagePatternCondition(normalizedPattern))
+        parameters[LOG_MESSAGE_PATTERN_PARAMETER] = messagePatternLikeParameter(normalizedPattern)
+    }
+
+    private fun MutableList<String>.addLogTraceFilter(traceId: String?) {
+        addIfPresent(traceId) { "trace_id = '${escapeSql(it)}'" }
+    }
+
+    private fun MutableList<String>.addLogExcludeFilters(request: LogQueryRequest) {
+        addIfPresent(request.excludeService) { "service != '${escapeSql(it)}'" }
+        addIfPresent(request.excludeEnvironment) { "environment != '${escapeSql(it)}'" }
+        addIfPresent(request.excludeContainerName) { "container_name != '${escapeSql(it)}'" }
+    }
+
+    private fun MutableList<String>.addLogExcludeFilters(filters: LogAnalyticsFilters) {
+        addIfPresent(filters.excludeService) { "service != '${escapeSql(it)}'" }
+        addIfPresent(filters.excludeEnvironment) { "environment != '${escapeSql(it)}'" }
+        addIfPresent(filters.excludeContainerName) { "container_name != '${escapeSql(it)}'" }
+    }
+
+    private fun MutableList<String>.addLogCursorFilter(cursor: String?) {
+        decodeCursor(cursor)?.let { (cursorTs, cursorLogId) ->
+            add(
+                "(timestamp < fromUnixTimestamp64Milli($cursorTs) OR " +
+                    "(timestamp = fromUnixTimestamp64Milli($cursorTs) AND " +
+                    "toString(log_id) < '${escapeSql(cursorLogId)}'))"
+            )
+        }
+    }
+
+    private fun MutableList<String>.addIfPresent(value: String?, condition: (String) -> String) {
+        if (!value.isNullOrBlank()) {
+            add(condition(value))
+        }
+    }
+
+    suspend fun getLogPattern(
+        organizationId: Long,
+        request: LogPatternRequest
+    ): LogPatternResponse = patternQuery.getLogPattern(organizationId, request)
 
     fun autoInterval(
         fromMs: Long?,
@@ -498,22 +632,13 @@ class LogService(private val logRepository: LogRepository) {
 
     suspend fun aggregateLogs(
         organizationId: Long,
-        from: String?,
-        to: String?,
+        filters: LogAnalyticsFilters,
         interval: String?,
-        query: String?,
-        levels: List<String>,
-        service: String?,
-        environment: String?,
-        tags: Map<String, String>,
-        excludeService: String?,
-        excludeEnvironment: String?,
-        excludeContainerName: String?,
-        excludeTags: Map<String, String>,
         groupBy: String?
     ): LogAggregateResponse {
-        val fromMs = parseTimeToMillis(from)
-        val toMs = parseTimeToMillis(to) ?: System.currentTimeMillis()
+        val where = buildLogAnalyticsWhere(organizationId, filters, defaultToNow = true)
+        val fromMs = where.fromMs
+        val toMs = where.toMs ?: System.currentTimeMillis()
         val resolvedInterval =
             if (interval.isNullOrBlank() || interval == "auto") {
                 autoInterval(fromMs, toMs)
@@ -522,56 +647,7 @@ class LogService(private val logRepository: LogRepository) {
             }
         val chInterval = intervalToClickHouse(resolvedInterval)
 
-        val conditions = mutableListOf(ClickHouseQueryUtils.orgIdClause(organizationId))
-        if (fromMs != null) conditions += "timestamp >= fromUnixTimestamp64Milli($fromMs)"
-        conditions += "timestamp <= fromUnixTimestamp64Milli($toMs)"
-
-        if (!service.isNullOrBlank()) conditions += "service = '${escapeSql(service)}'"
-        if (!environment.isNullOrBlank()) conditions += "environment = '${escapeSql(environment)}'"
-        val normalizedLevels = levels.map { normalizeLevel(it) }.filter { it.isNotBlank() }.distinct()
-        if (normalizedLevels.isNotEmpty()) {
-            val inClause = normalizedLevels.joinToString(",") { "'${escapeSql(it)}'" }
-            conditions += "level IN ($inClause)"
-        }
-        if (!query.isNullOrBlank()) {
-            // Use Datadog-compatible query parser
-            suspendRunCatching {
-                val parsed = queryParser.parse(query)
-                if (parsed.rootNode != null) {
-                    val queryCondition = queryParser.toClickHouseSql(parsed.rootNode, ::escapeSql)
-                    if (queryCondition.isNotBlank() && queryCondition != "1=1") {
-                        conditions += "($queryCondition)"
-                    }
-                }
-            }.getOrElse { e ->
-                logger.error(e) {
-                    "Failed to parse query (query_fp=${utf8Fingerprint(query)}), falling back to simple search"
-                }
-                // Fallback: treat as simple full-text search
-                conditions += buildSimpleSearchCondition(query)
-            }
-        }
-        tags.forEach { (key, value) ->
-            val condition = buildTagCondition(key, value)
-            if (condition.isNotBlank()) {
-                conditions += condition
-            }
-        }
-
-        // Exclude filters
-        if (!excludeService.isNullOrBlank()) conditions += "service != '${escapeSql(excludeService)}'"
-        if (!excludeEnvironment.isNullOrBlank()) conditions += "environment != '${escapeSql(excludeEnvironment)}'"
-        if (!excludeContainerName.isNullOrBlank()) {
-            conditions += "container_name != '${escapeSql(excludeContainerName)}'"
-        }
-        excludeTags.forEach { (key, value) ->
-            val condition = buildTagCondition(key, value, exclude = true)
-            if (condition.isNotBlank()) {
-                conditions += condition
-            }
-        }
-
-        val whereClause = conditions.joinToString(" AND ")
+        val whereClause = where.conditions.joinToString(" AND ")
 
         val validGroupBy = groupBy?.takeIf { it in setOf("level", "service", "environment") }
 
@@ -611,39 +687,36 @@ class LogService(private val logRepository: LogRepository) {
             "Aggregate logs SQL for org $organizationId (fromMs=$fromMs, toMs=$toMs, interval=$chInterval, " +
                 "groupBy=$validGroupBy): query_fp=${utf8Fingerprint(sql)}"
         }
-        val body = logRepository.executeClickHouseQuery(sql)
+        val body = logRepository.executeClickHouseQuery(sql, where.parameters)
         logger.debug { "Aggregate logs response body (first 500 chars): ${body.take(WARN_BODY_PREVIEW_CHARS)}" }
         if (body.isClickHouseError()) {
             logger.warn { "Failed to aggregate logs: ${body.take(ERROR_BODY_PREVIEW_CHARS)}" }
             return LogAggregateResponse(buckets = emptyList(), totalCount = 0, interval = resolvedInterval)
         }
 
+        val parsed = parseAggregateRows(body, validGroupBy)
+
+        logger.debug {
+            "Aggregate logs result for org $organizationId: ${parsed.buckets.size} buckets, " +
+                "totalCount=${parsed.totalCount}, " +
+                "interval=$resolvedInterval"
+        }
+        return LogAggregateResponse(
+            buckets = parsed.buckets,
+            totalCount = parsed.totalCount,
+            interval = resolvedInterval
+        )
+    }
+
+    private fun parseAggregateRows(
+        body: String,
+        validGroupBy: String?
+    ): AggregateParseResult {
         val bucketMap = LinkedHashMap<String, MutableMap<String, Long>>()
         var totalCount = 0L
 
         body.lineSequence().map { it.trim() }.filter { it.isNotBlank() }.forEach { line ->
-            try {
-                val obj = json.parseToJsonElement(line).jsonObject
-                val bucketTs = obj["bucket"]?.jsonPrimitive?.content ?: return@forEach
-                val cnt = obj["cnt"]?.jsonPrimitive?.longOrNull ?: 0L
-                totalCount += cnt
-
-                val groups = bucketMap.getOrPut(bucketTs) { mutableMapOf() }
-                if (validGroupBy != null) {
-                    val groupValue = obj["group_value"]?.jsonPrimitive?.content ?: "unknown"
-                    groups[groupValue] = (groups[groupValue] ?: 0L) + cnt
-                } else {
-                    groups["_total"] = (groups["_total"] ?: 0L) + cnt
-                }
-            } catch (_: SerializationException) {
-                // Ignored: skip malformed JSON line
-            } catch (_: IOException) {
-                // Ignored: skip malformed JSON line
-            } catch (_: IllegalStateException) {
-                // Ignored: skip malformed JSON line
-            } catch (_: IllegalArgumentException) {
-                // Ignored: skip malformed JSON line
-            }
+            parseAggregateRow(line, validGroupBy, bucketMap)?.let { totalCount += it }
         }
 
         val buckets =
@@ -655,96 +728,39 @@ class LogService(private val logRepository: LogRepository) {
                     groups = if (validGroupBy != null) groups else emptyMap()
                 )
             }
-
-        logger.debug {
-            "Aggregate logs result for org $organizationId: ${buckets.size} buckets, totalCount=$totalCount, " +
-                "interval=$resolvedInterval"
-        }
-        return LogAggregateResponse(buckets = buckets, totalCount = totalCount, interval = resolvedInterval)
+        return AggregateParseResult(buckets = buckets, totalCount = totalCount)
     }
+
+    private fun parseAggregateRow(
+        line: String,
+        validGroupBy: String?,
+        bucketMap: LinkedHashMap<String, MutableMap<String, Long>>
+    ): Long? =
+        suspendRunCatching {
+            val obj = json.parseToJsonElement(line).jsonObject
+            val bucketTs = obj["bucket"]?.jsonPrimitive?.content ?: return@suspendRunCatching null
+            val cnt = obj["cnt"]?.jsonPrimitive?.longOrNull ?: 0L
+            val groups = bucketMap.getOrPut(bucketTs) { mutableMapOf() }
+            if (validGroupBy != null) {
+                val groupValue = obj["group_value"]?.jsonPrimitive?.content ?: "unknown"
+                groups[groupValue] = (groups[groupValue] ?: 0L) + cnt
+            } else {
+                groups["_total"] = (groups["_total"] ?: 0L) + cnt
+            }
+            cnt
+        }.getOrElse { null }
 
     suspend fun topValues(
         organizationId: Long,
         field: String,
         limit: Int,
-        from: String?,
-        to: String?,
-        query: String?,
-        levels: List<String>,
-        service: String?,
-        environment: String?,
-        tags: Map<String, String>,
-        excludeService: String?,
-        excludeEnvironment: String?,
-        excludeContainerName: String?,
-        excludeTags: Map<String, String>
+        filters: LogAnalyticsFilters
     ): LogTopResponse {
-        val conditions = mutableListOf(ClickHouseQueryUtils.orgIdClause(organizationId))
-        val fromMs = parseTimeToMillis(from)
-        if (fromMs != null) conditions += "timestamp >= fromUnixTimestamp64Milli($fromMs)"
-        val toMs = parseTimeToMillis(to)
-        if (toMs != null) conditions += "timestamp <= fromUnixTimestamp64Milli($toMs)"
-        if (!service.isNullOrBlank()) conditions += "service = '${escapeSql(service)}'"
-        if (!environment.isNullOrBlank()) conditions += "environment = '${escapeSql(environment)}'"
-        val normalizedLevels = levels.map { normalizeLevel(it) }.filter { it.isNotBlank() }.distinct()
-        if (normalizedLevels.isNotEmpty()) {
-            val inClause = normalizedLevels.joinToString(",") { "'${escapeSql(it)}'" }
-            conditions += "level IN ($inClause)"
-        }
-        if (!query.isNullOrBlank()) {
-            // Use Datadog-compatible query parser
-            suspendRunCatching {
-                val parsed = queryParser.parse(query)
-                if (parsed.rootNode != null) {
-                    val queryCondition = queryParser.toClickHouseSql(parsed.rootNode, ::escapeSql)
-                    if (queryCondition.isNotBlank() && queryCondition != "1=1") {
-                        conditions += "($queryCondition)"
-                    }
-                }
-            }.getOrElse { e ->
-                logger.error(e) {
-                    "Failed to parse query (query_fp=${utf8Fingerprint(query)}), falling back to simple search"
-                }
-                // Fallback: treat as simple full-text search
-                conditions += buildSimpleSearchCondition(query)
-            }
-        }
-        tags.forEach { (key, value) ->
-            val condition = buildTagCondition(key, value)
-            if (condition.isNotBlank()) {
-                conditions += condition
-            }
-        }
-
-        // Exclude filters
-        if (!excludeService.isNullOrBlank()) conditions += "service != '${escapeSql(excludeService)}'"
-        if (!excludeEnvironment.isNullOrBlank()) conditions += "environment != '${escapeSql(excludeEnvironment)}'"
-        if (!excludeContainerName.isNullOrBlank()) {
-            conditions += "container_name != '${escapeSql(excludeContainerName)}'"
-        }
-        excludeTags.forEach { (key, value) ->
-            val condition = buildTagCondition(key, value, exclude = true)
-            if (condition.isNotBlank()) {
-                conditions += condition
-            }
-        }
-
-        val whereClause = conditions.joinToString(" AND ")
+        val where = buildLogAnalyticsWhere(organizationId, filters)
+        val whereClause = where.conditions.joinToString(" AND ")
         val safeLimit = limit.coerceIn(1, MAX_TOP_VALUES_LIMIT)
 
-        // Determine the SQL column expression for the field
-        val columnExpr =
-            when (field) {
-                "service", "level", "environment", "host", "container_name" -> {
-                    field
-                }
-
-                else -> {
-                    // Treat as tag key
-                    val escapedKey = escapeSql(field)
-                    "tags['$escapedKey']"
-                }
-            }
+        val columnExpr = topValueColumnExpression(field)
 
         val sql =
             """
@@ -757,29 +773,13 @@ class LogService(private val logRepository: LogRepository) {
             FORMAT JSONEachRow
             """.trimIndent()
 
-        val body = logRepository.executeClickHouseQuery(sql)
+        val body = logRepository.executeClickHouseQuery(sql, where.parameters)
         if (body.isClickHouseError()) {
             logger.warn { "Failed to query top values: ${body.take(ERROR_BODY_PREVIEW_CHARS)}" }
             return LogTopResponse(field = field, values = emptyList(), totalCount = 0)
         }
 
-        val values = mutableListOf<LogTopValue>()
-        body.lineSequence().map { it.trim() }.filter { it.isNotBlank() }.forEach { line ->
-            try {
-                val obj = json.parseToJsonElement(line).jsonObject
-                val value = obj["field_value"]?.jsonPrimitive?.content ?: return@forEach
-                val cnt = obj["cnt"]?.jsonPrimitive?.longOrNull ?: 0L
-                values += LogTopValue(value = value, count = cnt)
-            } catch (_: SerializationException) {
-                // Ignored: skip malformed JSON line
-            } catch (_: IOException) {
-                // Ignored: skip malformed JSON line
-            } catch (_: IllegalStateException) {
-                // Ignored: skip malformed JSON line
-            } catch (_: IllegalArgumentException) {
-                // Ignored: skip malformed JSON line
-            }
-        }
+        val values = parseTopValueRows(body)
 
         // Get total count for percentage calculation
         val totalSql =
@@ -787,76 +787,51 @@ class LogService(private val logRepository: LogRepository) {
             SELECT count() AS cnt FROM `$clickhouseDb`.logs WHERE $whereClause
             FORMAT JSONEachRow
             """.trimIndent()
-        val totalResponse = logRepository.executeClickHouseQuery(totalSql)
-        val totalCount =
-            try {
-                json
-                    .parseToJsonElement(totalResponse.trim())
-                    .jsonObject["cnt"]
-                    ?.jsonPrimitive
-                    ?.longOrNull ?: 0L
-            } catch (_: SerializationException) {
-                0L
-            } catch (_: IOException) {
-                0L
-            } catch (_: IllegalStateException) {
-                0L
-            } catch (_: IllegalArgumentException) {
-                0L
-            }
+        val totalCount = parseCountResponse(logRepository.executeClickHouseQuery(totalSql, where.parameters))
 
         return LogTopResponse(field = field, values = values, totalCount = totalCount)
     }
 
+    private fun topValueColumnExpression(field: String): String =
+        when (field) {
+            "service", "service_name" -> "service"
+            "message" -> "message"
+            "level", "environment", "host", "container_name" -> field
+            else -> {
+                val escapedKey = escapeSql(field)
+                "tags['$escapedKey']"
+            }
+        }
+
+    private fun parseTopValueRows(body: String): List<LogTopValue> =
+        body
+            .lineSequence()
+            .map { it.trim() }
+            .filter { it.isNotBlank() }
+            .mapNotNull { line ->
+                suspendRunCatching {
+                    val obj = json.parseToJsonElement(line).jsonObject
+                    val value = obj["field_value"]?.jsonPrimitive?.content ?: return@suspendRunCatching null
+                    LogTopValue(value = value, count = obj["cnt"]?.jsonPrimitive?.longOrNull ?: 0L)
+                }.getOrElse { null }
+            }.toList()
+
+    private fun parseCountResponse(body: String): Long =
+        suspendRunCatching {
+            json
+                .parseToJsonElement(body.trim())
+                .jsonObject["cnt"]
+                ?.jsonPrimitive
+                ?.longOrNull ?: 0L
+        }.getOrElse { 0L }
+
     suspend fun exportCsv(
         organizationId: Long,
-        from: String?,
-        to: String?,
-        query: String?,
-        levels: List<String>,
-        service: String?,
-        environment: String?,
-        tags: Map<String, String>,
-        excludeService: String?,
-        excludeEnvironment: String?,
-        excludeContainerName: String?,
-        excludeTags: Map<String, String>,
+        filters: LogAnalyticsFilters,
         limit: Int
     ): String {
-        val conditions = mutableListOf(ClickHouseQueryUtils.orgIdClause(organizationId))
-        val fromMs = parseTimeToMillis(from)
-        if (fromMs != null) conditions += "timestamp >= fromUnixTimestamp64Milli($fromMs)"
-        val toMs = parseTimeToMillis(to)
-        if (toMs != null) conditions += "timestamp <= fromUnixTimestamp64Milli($toMs)"
-        if (!service.isNullOrBlank()) conditions += "service = '${escapeSql(service)}'"
-        if (!environment.isNullOrBlank()) conditions += "environment = '${escapeSql(environment)}'"
-        val normalizedLevels = levels.map { normalizeLevel(it) }.filter { it.isNotBlank() }.distinct()
-        if (normalizedLevels.isNotEmpty()) {
-            val inClause = normalizedLevels.joinToString(",") { "'${escapeSql(it)}'" }
-            conditions += "level IN ($inClause)"
-        }
-        addExportCsvQueryConditions(query, conditions)
-        tags.forEach { (key, value) ->
-            val condition = buildTagCondition(key, value)
-            if (condition.isNotBlank()) {
-                conditions += condition
-            }
-        }
-
-        // Exclude filters
-        if (!excludeService.isNullOrBlank()) conditions += "service != '${escapeSql(excludeService)}'"
-        if (!excludeEnvironment.isNullOrBlank()) conditions += "environment != '${escapeSql(excludeEnvironment)}'"
-        if (!excludeContainerName.isNullOrBlank()) {
-            conditions += "container_name != '${escapeSql(excludeContainerName)}'"
-        }
-        excludeTags.forEach { (key, value) ->
-            val condition = buildTagCondition(key, value, exclude = true)
-            if (condition.isNotBlank()) {
-                conditions += condition
-            }
-        }
-
-        val whereClause = conditions.joinToString(" AND ")
+        val where = buildLogAnalyticsWhere(organizationId, filters)
+        val whereClause = where.conditions.joinToString(" AND ")
         val safeLimit = limit.coerceIn(1, MAX_EXPORT_LIMIT)
 
         val sql =
@@ -874,7 +849,7 @@ class LogService(private val logRepository: LogRepository) {
             """.trimIndent()
 
         logger.debug { "Export CSV SQL: query_fp=${utf8Fingerprint(sql)}" }
-        val body = logRepository.executeClickHouseQuery(sql)
+        val body = logRepository.executeClickHouseQuery(sql, where.parameters)
         if (body.isClickHouseError()) {
             logger.error {
                 "ClickHouse export error. query_fp=${utf8Fingerprint(sql)}\n" +
@@ -910,43 +885,6 @@ class LogService(private val logRepository: LogRepository) {
         }
 
         return sb.toString()
-    }
-
-    /** Applies Datadog-style query parsing to [conditions], or falls back to simple search on parse errors. */
-    private fun addExportCsvQueryConditions(
-        query: String?,
-        conditions: MutableList<String>,
-    ) {
-        if (query.isNullOrBlank()) return
-        try {
-            val parsed = queryParser.parse(query)
-            if (parsed.rootNode != null) {
-                val queryCondition = queryParser.toClickHouseSql(parsed.rootNode, ::escapeSql)
-                if (queryCondition.isNotBlank() && queryCondition != "1=1") {
-                    conditions += "($queryCondition)"
-                }
-            }
-        } catch (e: SerializationException) {
-            logger.error(e) {
-                "Failed to parse query (query_fp=${utf8Fingerprint(query)}), falling back to simple search"
-            }
-            conditions += buildSimpleSearchCondition(query)
-        } catch (e: IOException) {
-            logger.error(e) {
-                "Failed to parse query (query_fp=${utf8Fingerprint(query)}), falling back to simple search"
-            }
-            conditions += buildSimpleSearchCondition(query)
-        } catch (e: IllegalStateException) {
-            logger.error(e) {
-                "Failed to parse query (query_fp=${utf8Fingerprint(query)}), falling back to simple search"
-            }
-            conditions += buildSimpleSearchCondition(query)
-        } catch (e: IllegalArgumentException) {
-            logger.error(e) {
-                "Failed to parse query (query_fp=${utf8Fingerprint(query)}), falling back to simple search"
-            }
-            conditions += buildSimpleSearchCondition(query)
-        }
     }
 
     private fun csvEscape(value: String): String {
@@ -1432,7 +1370,7 @@ class LogService(private val logRepository: LogRepository) {
             service = resourceCtx.serviceName.ifEmpty { attributes["service.name"] },
             serviceNamespace = resourceCtx.serviceNamespace.ifEmpty { attributes["service.namespace"] },
             environment = resourceCtx.environment.ifEmpty {
-                attributes["deployment.environment"] ?: attributes["service.environment"]
+                OtlpParsingUtils.extractDeploymentEnvironment(attributes)
             },
             host = resourceCtx.hostName.ifEmpty { attributes["host.name"] },
             source = "otlp",
@@ -1510,7 +1448,7 @@ class LogService(private val logRepository: LogRepository) {
             service = resourceCtx.serviceName.ifEmpty { attributes["service.name"] },
             serviceNamespace = resourceCtx.serviceNamespace.ifEmpty { attributes["service.namespace"] },
             environment = resourceCtx.environment.ifEmpty {
-                attributes["deployment.environment"] ?: attributes["service.environment"]
+                OtlpParsingUtils.extractDeploymentEnvironment(attributes)
             },
             host = resourceCtx.hostName.ifEmpty { attributes["host.name"] },
             source = "otlp",
@@ -1624,12 +1562,12 @@ class LogService(private val logRepository: LogRepository) {
 
     private fun buildSimpleSearchCondition(term: String): String {
         val escaped = ClickHouseSqlUtils.escapeLikePattern(term)
-        val hasSeparators = term.any { it == '-' || it == '.' || it == '/' || it == ':' || it == ' ' }
-        return if (hasSeparators) {
-            "(message ILIKE '%$escaped%' OR body ILIKE '%$escaped%')"
-        } else {
+        val isSimpleToken = term.all { it.isLetterOrDigit() }
+        return if (isSimpleToken) {
             val tokenEscaped = ClickHouseSqlUtils.escapeSql(term)
             "(hasTokenCaseInsensitive(message, '$tokenEscaped') OR hasTokenCaseInsensitive(body, '$tokenEscaped'))"
+        } else {
+            "(message ILIKE '%$escaped%' OR body ILIKE '%$escaped%')"
         }
     }
 

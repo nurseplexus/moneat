@@ -137,6 +137,15 @@ To avoid Sonar/ESLint code smells in `dashboard/`:
 
 ## Key Conventions
 
+### Testing Guidelines
+
+- ❌ **Do not call production private methods from new or touched tests** — avoid reflection helpers like
+  `getDeclaredMethod`, `declaredFunctions`, `isAccessible = true`, or equivalent access hacks for behavior coverage.
+- ✅ **Test observable behavior through public APIs, routes, or service methods** whenever practical.
+- ✅ **Extract complex private logic into a small collaborator** with an explicit `internal` or public API when direct
+  unit coverage is warranted.
+- ✅ **Test-local private helper methods are fine** — the rule is about reaching into production internals.
+
 ### Warnings and lint fixes (suppress rarely)
 
 **CRITICAL:** When asked to fix a compiler warning, linter finding, or static analysis issue (Detekt, ESLint, Sonar, Kotlin compiler, etc.):
@@ -200,6 +209,9 @@ To avoid Sonar code smells and keep code consistent:
 
 - **Keep cognitive complexity low (≤15)** – extract helper functions when logic gets nested:
   - Use `runCatching { }.getOrNull()` only in non-suspending, synchronous helpers (e.g., parsing/mapping functions). **Avoid in suspending/coroutine contexts**: `runCatching` swallows all `Throwable`s including `CancellationException`, which can break coroutine cancellation. In suspend functions, use `suspendRunCatching` from `com.moneat.utils` instead — it rethrows `CancellationException` automatically and composes with the `Result` API (`getOrElse`, `getOrNull`, `getOrDefault`, `onFailure`). Keep the manual `catch (e: CancellationException) { throw e }` pattern only when `Result` doesn't compose cleanly (e.g. the catch block mutates state and then rethrows).
+  - In Ktor route handlers, `coroutineScope`, `async`, workers, and other coroutine paths, wrap failures with
+    `suspendRunCatching { ... }` whenever the guarded call may suspend. Reserve plain `runCatching` for synchronous
+    parsing/formatting helpers.
   - Extract complex parsing or mapping into private functions
   - Prefer early returns over nested conditionals
 
@@ -236,6 +248,29 @@ When adding or extending the repository layer:
 - **ClickHouse**: Custom versioned migrations in `backend/src/main/resources/db/clickhouse_migration/V*__*.sql`
 - Migration naming: `V{number}__{description}.sql` (e.g., `V1__initial_schema.sql`)
 - Never modify existing migrations; always create new ones
+
+### Public Resource IDs
+Public Moneat-owned resources should use opaque UUID `resource_id` values at API boundaries. Keep numeric primary keys
+for internal joins, repository internals, ClickHouse joins, queue payloads, and auth claims unless those values are
+directly serialized to users.
+
+- Do not expose auto-increment database IDs in public JSON responses or accept them in public route params.
+- Public DTO `id` fields should usually remain named `id`, but their value should be the UUID `resource_id`; avoid
+  exposing both `id` and `resourceId` after cleanup.
+- Add `resource_id UUID NOT NULL DEFAULT gen_random_uuid()` to user-facing PostgreSQL tables that lack a public ID.
+  Mirror the column in Exposed with UUID types.
+- Add scoped uniqueness for new public IDs. Use `UNIQUE (organization_id, resource_id)` for organization-owned
+  resources, `UNIQUE (user_id, resource_id)` for user-owned resources, `UNIQUE (parent_id, resource_id)` when route
+  resolution is always parent-scoped, and `UNIQUE (resource_id)` only for truly global resources.
+- Resolver helpers should parse UUID route params, reject malformed IDs with 400, resolve the numeric primary key under
+  the caller's organization/user scope, and return 404 for unknown or inaccessible resources.
+- Update backend DTOs, route params, frontend API types, query keys, forms, and tests in the same branch so no numeric
+  public ID contract remains.
+- Add route or contract tests proving numeric path IDs are rejected, UUID path IDs resolve only within caller scope, and
+  serialized public responses do not include numeric DB IDs.
+- Do not migrate protocol-native or third-party IDs just because they look numeric or UUID-like. Leave trace IDs, span
+  IDs, event IDs, replay IDs, container IDs, PIDs, status codes, and externally supplied cloud/security `resource_id`
+  values in their native format unless Moneat owns that resource identity.
 
 ### Event Fingerprinting
 Events are grouped into issues using fingerprints generated from:

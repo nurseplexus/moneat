@@ -100,6 +100,7 @@ function HelpTip({text}: {text: string}) {
 const KNOWN_TIERS = ['FREE', 'PRO', 'TEAM', 'BUSINESS']
 const TIER_ORDER: Record<string, number> = {FREE: 0, PRO: 1, TEAM: 2, BUSINESS: 3}
 const BYTES_PER_GB = 1024 * 1024 * 1024
+const PRICING_PREVIEW_LIMIT_COUNT = 6
 
 function formatRetentionSummary(
   errorDays: number,
@@ -408,6 +409,179 @@ function buildCreateTierVersionRequest(form: CreateFormState): CreateTierVersion
   }
 }
 
+type UpdatePriceFormData = {
+  stripeBasePriceId: string
+  stripeOveragePriceId: string
+  stripeYearlyBasePriceId: string
+  stripeYearlyOveragePriceId: string
+  stripeOncallPriceId: string
+  stripeOncallYearlyPriceId: string
+}
+
+const EMPTY_UPDATE_PRICE_FORM: UpdatePriceFormData = {
+  stripeBasePriceId: '',
+  stripeOveragePriceId: '',
+  stripeYearlyBasePriceId: '',
+  stripeYearlyOveragePriceId: '',
+  stripeOncallPriceId: '',
+  stripeOncallYearlyPriceId: '',
+}
+
+function toBillingPlans(value: unknown): BillingPlan[] {
+  if (!Array.isArray(value)) return []
+  const first = value[0]
+  if (first == null || typeof first !== 'object' || !('tier' in first)) return []
+  return value as BillingPlan[]
+}
+
+function toBillingTierConfigs(value: unknown): BillingTierConfig[] {
+  if (!Array.isArray(value)) return []
+  return value as BillingTierConfig[]
+}
+
+function tierVersionKey(config: BillingTierConfig | undefined): string | undefined {
+  if (!config) return undefined
+  return `${config.tierName}-${config.version}`
+}
+
+function resolveCreateForm(
+  formState: {tierVersion: string | undefined; data: CreateFormState},
+  currentTierVersion: string | undefined,
+  currentTierConfig: BillingTierConfig | undefined,
+): CreateFormState {
+  if (formState.tierVersion === currentTierVersion && currentTierVersion !== undefined) return formState.data
+  if (currentTierConfig) return buildCreateFormFromConfig(currentTierConfig)
+  return DEFAULT_FORM
+}
+
+function buildUpdatePriceForm(config: BillingTierConfig | undefined): UpdatePriceFormData {
+  if (!config) return EMPTY_UPDATE_PRICE_FORM
+  return {
+    stripeBasePriceId: config.stripeBasePriceId ?? '',
+    stripeOveragePriceId: config.stripeOveragePriceId ?? '',
+    stripeYearlyBasePriceId: config.stripeYearlyBasePriceId ?? '',
+    stripeYearlyOveragePriceId: config.stripeYearlyOveragePriceId ?? '',
+    stripeOncallPriceId: config.stripeOncallPriceId ?? '',
+    stripeOncallYearlyPriceId: config.stripeOncallYearlyPriceId ?? '',
+  }
+}
+
+function resolveUpdatePriceForm(
+  formState: {tierVersion: string | undefined; data: UpdatePriceFormData},
+  currentTierVersion: string | undefined,
+  selectedConfig: BillingTierConfig | undefined,
+): UpdatePriceFormData {
+  if (formState.tierVersion === currentTierVersion && currentTierVersion !== undefined) return formState.data
+  return buildUpdatePriceForm(selectedConfig)
+}
+
+function filterSubscriptionsByText(
+  subscriptions: AdminBillingSubscription[],
+  filter: string,
+): AdminBillingSubscription[] {
+  if (!filter) return subscriptions
+  const lower = filter.toLowerCase()
+  return subscriptions.filter(
+    (subscription) =>
+      subscription.organizationName.toLowerCase().includes(lower) ||
+      subscription.plan.toLowerCase().includes(lower) ||
+      subscription.status.toLowerCase().includes(lower),
+  )
+}
+
+function availableBillingTiers(currentPlans: BillingPlan[]): string[] {
+  const fromPlans = currentPlans.map((plan) => plan.tier.tierName)
+  const combined = new Set([...KNOWN_TIERS, ...fromPlans])
+  return Array.from(combined).sort((a, b) => a.localeCompare(b))
+}
+
+function numberFromText(value: string): number | null {
+  if (!value.trim()) return null
+  return Number(value)
+}
+
+function buildDraftPricingTier(
+  createTier: string,
+  createForm: CreateFormState,
+  currentTierConfig: BillingTierConfig | undefined,
+): PricingCardTierInput | null {
+  if (!currentTierConfig) return null
+  return {
+    tierName: createTier,
+    monthlyPriceCents: createForm.monthlyPriceCents,
+    yearlyPriceCents: createForm.yearlyPriceCents,
+    trialDays: createForm.trialDays,
+    monthlyGbLimit: Math.max(0, Math.round(createForm.monthlyGbLimitGb * BYTES_PER_GB)),
+    monthlyLlmEventLimit: createForm.monthlyLlmEventLimit,
+    retentionDays: createForm.retentionDays,
+    apmTraceRetentionDays: createForm.apmTraceRetentionDays,
+    maxProjects: numberFromText(createForm.maxProjects),
+    maxSystems: createForm.maxSystems,
+    monitorIntervalSeconds: createForm.monitorIntervalSeconds,
+    sessionReplayEnabled: currentTierConfig.sessionReplayEnabled,
+    statusPagesEnabled: currentTierConfig.statusPagesEnabled,
+    statusPageCustomDomainEnabled: currentTierConfig.statusPageCustomDomainEnabled,
+    slackEnabled: currentTierConfig.slackEnabled,
+    discordEnabled: currentTierConfig.discordEnabled,
+    incidentIoEnabled: currentTierConfig.incidentIoEnabled,
+    samlEnabled: currentTierConfig.samlEnabled,
+    oidcEnabled: currentTierConfig.oidcEnabled,
+    prioritySupportEnabled: currentTierConfig.prioritySupportEnabled,
+    slaEnabled: currentTierConfig.slaEnabled,
+    customRetentionEnabled: currentTierConfig.customRetentionEnabled,
+    oncallEnabled: createForm.oncallEnabled,
+    oncallPerUserMonthlyCents: createForm.oncallPerUserMonthlyCents,
+    maxAnalyticsSites: numberFromText(createForm.maxAnalyticsSites),
+    analyticsRetentionDays: createForm.analyticsRetentionDays,
+    monthlyAnalyticsPageviewLimit: createForm.monthlyAnalyticsPageviewLimit,
+    analyticsPageviewOverageRateCentsPer100k: createForm.analyticsPageviewOverageRateCentsPer100k,
+  }
+}
+
+function mergePreviewTier(
+  tier: PricingCardTierInput,
+  createTier: string,
+  draftTier: PricingCardTierInput | null,
+  plansByTier: Map<string, BillingPlan>,
+): PricingCardTierInput {
+  if (tier.tierName === createTier && draftTier) return draftTier
+  return {
+    ...tier,
+    trialDays: plansByTier.get(tier.tierName)?.trialDays ?? tier.trialDays,
+  }
+}
+
+function buildPreviewCards(
+  currentPlans: BillingPlan[],
+  createTier: string,
+  createForm: CreateFormState,
+  currentTierConfig: BillingTierConfig | undefined,
+  previewInterval: BillingInterval,
+) {
+  const plansByTier = new Map(currentPlans.map((plan) => [plan.tier.tierName, plan]))
+  const draftTier = buildDraftPricingTier(createTier, createForm, currentTierConfig)
+
+  return currentPlans
+    .map((plan) => mergePreviewTier(plan.tier, createTier, draftTier, plansByTier))
+    .sort((a, b) => (TIER_ORDER[a.tierName] ?? 99) - (TIER_ORDER[b.tierName] ?? 99))
+    .map((tier) => buildPricingCardModel(tier, previewInterval))
+}
+
+export const adminBillingHelperTestHooks = {
+  DEFAULT_FORM,
+  EMPTY_UPDATE_PRICE_FORM,
+  availableBillingTiers,
+  buildPreviewCards,
+  buildUpdatePriceForm,
+  filterSubscriptionsByText,
+  numberFromText,
+  resolveCreateForm,
+  resolveUpdatePriceForm,
+  tierVersionKey,
+  toBillingPlans,
+  toBillingTierConfigs,
+}
+
 // ─── Main Page ────────────────────────────────────────────────────────────────
 
 function AdminBillingPage() {
@@ -428,24 +602,10 @@ function AdminBillingPage() {
   const [previewInterval, setPreviewInterval] = useState<BillingInterval>('monthly')
   const [updatePriceFormState, setUpdatePriceFormState] = useState<{
     tierVersion: string | undefined
-    data: {
-      stripeBasePriceId: string
-      stripeOveragePriceId: string
-      stripeYearlyBasePriceId: string
-      stripeYearlyOveragePriceId: string
-      stripeOncallPriceId: string
-      stripeOncallYearlyPriceId: string
-    }
+    data: UpdatePriceFormData
   }>({
     tierVersion: undefined,
-    data: {
-      stripeBasePriceId: '',
-      stripeOveragePriceId: '',
-      stripeYearlyBasePriceId: '',
-      stripeYearlyOveragePriceId: '',
-      stripeOncallPriceId: '',
-      stripeOncallYearlyPriceId: '',
-    },
+    data: EMPTY_UPDATE_PRICE_FORM,
   })
   const [showCreateConfirm, setShowCreateConfirm] = useState(false)
   const [showMigrateConfirm, setShowMigrateConfirm] = useState(false)
@@ -481,21 +641,15 @@ function AdminBillingPage() {
 
   // ─── Derived Data ─────────────────────────────────────────────────────────
 
-  const currentPlans = useMemo(
-    () =>
-      (Array.isArray(currentPlansRaw) && currentPlansRaw.length > 0 && 'tier' in currentPlansRaw[0]
-        ? currentPlansRaw
-        : []) as BillingPlan[],
-    [currentPlansRaw],
-  )
+  const currentPlans = useMemo(() => toBillingPlans(currentPlansRaw), [currentPlansRaw])
 
   const createTierVersions = useMemo(
-    () => (Array.isArray(createTierVersionsRaw) ? createTierVersionsRaw : []) as BillingTierConfig[],
+    () => toBillingTierConfigs(createTierVersionsRaw),
     [createTierVersionsRaw],
   )
 
   const migrateTierVersions = useMemo(
-    () => (Array.isArray(migrateTierVersionsRaw) ? migrateTierVersionsRaw : []) as BillingTierConfig[],
+    () => toBillingTierConfigs(migrateTierVersionsRaw),
     [migrateTierVersionsRaw],
   )
 
@@ -504,10 +658,8 @@ function AdminBillingPage() {
     [createTierVersions],
   )
 
-  const currentTierVersion = currentTierConfig ? `${currentTierConfig.tierName}-${currentTierConfig.version}` : undefined
-  const createForm = (createFormState.tierVersion === currentTierVersion && currentTierVersion !== undefined)
-    ? createFormState.data
-    : (currentTierConfig ? buildCreateFormFromConfig(currentTierConfig) : DEFAULT_FORM)
+  const currentTierVersion = tierVersionKey(currentTierConfig)
+  const createForm = resolveCreateForm(createFormState, currentTierVersion, currentTierConfig)
   const setCreateForm = (updater: CreateFormState | ((prev: CreateFormState) => CreateFormState)) => {
     setCreateFormState({
       tierVersion: currentTierVersion,
@@ -520,13 +672,18 @@ function AdminBillingPage() {
     [migrateTierVersions, targetVersion],
   )
 
+  const targetTierForm = useMemo(
+    () => (targetTierConfig ? buildCreateFormFromConfig(targetTierConfig) : null),
+    [targetTierConfig],
+  )
+
   const currentMigrateTierConfig = useMemo(
     () => migrateTierVersions.find((v) => v.isCurrent),
     [migrateTierVersions],
   )
 
   const updateTierVersions = useMemo(
-    () => (Array.isArray(updateTierVersionsRaw) ? updateTierVersionsRaw : []) as BillingTierConfig[],
+    () => toBillingTierConfigs(updateTierVersionsRaw),
     [updateTierVersionsRaw],
   )
 
@@ -535,92 +692,32 @@ function AdminBillingPage() {
     [updateTierVersions, updateVersion],
   )
 
-  const currentUpdateTierVersion = selectedUpdateTierConfig ? String(selectedUpdateTierConfig.version) : undefined
-  const updatePriceForm = (updatePriceFormState.tierVersion === currentUpdateTierVersion && currentUpdateTierVersion !== undefined)
-    ? updatePriceFormState.data
-    : {
-        stripeBasePriceId: selectedUpdateTierConfig?.stripeBasePriceId ?? '',
-        stripeOveragePriceId: selectedUpdateTierConfig?.stripeOveragePriceId ?? '',
-        stripeYearlyBasePriceId: selectedUpdateTierConfig?.stripeYearlyBasePriceId ?? '',
-        stripeYearlyOveragePriceId: selectedUpdateTierConfig?.stripeYearlyOveragePriceId ?? '',
-        stripeOncallPriceId: selectedUpdateTierConfig?.stripeOncallPriceId ?? '',
-        stripeOncallYearlyPriceId: selectedUpdateTierConfig?.stripeOncallYearlyPriceId ?? '',
-      }
-  const setUpdatePriceForm = (updater: typeof updatePriceFormState.data | ((prev: typeof updatePriceFormState.data) => typeof updatePriceFormState.data)) => {
+  const currentUpdateTierVersion = selectedUpdateTierConfig?.version.toString()
+  const updatePriceForm = resolveUpdatePriceForm(
+    updatePriceFormState,
+    currentUpdateTierVersion,
+    selectedUpdateTierConfig,
+  )
+  const setUpdatePriceForm = (updater: UpdatePriceFormData | ((prev: UpdatePriceFormData) => UpdatePriceFormData)) => {
     setUpdatePriceFormState({
       tierVersion: currentUpdateTierVersion,
       data: typeof updater === 'function' ? updater(updatePriceForm) : updater,
     })
   }
 
-  const filteredSubscriptions = useMemo(() => {
-    if (!subFilter) return subscriptions
-    const lower = subFilter.toLowerCase()
-    return subscriptions.filter(
-      (s: AdminBillingSubscription) =>
-        s.organizationName.toLowerCase().includes(lower) ||
-        s.plan.toLowerCase().includes(lower) ||
-        s.status.toLowerCase().includes(lower),
-    )
-  }, [subscriptions, subFilter])
+  const filteredSubscriptions = useMemo(
+    () => filterSubscriptionsByText(subscriptions, subFilter),
+    [subscriptions, subFilter],
+  )
 
   const validationErrors = useMemo(() => validateCreateForm(createForm), [createForm])
   const hasValidationErrors = Object.keys(validationErrors).length > 0
 
   // Unique tier names from current plans for the dropdown
-  const availableTiers = useMemo(() => {
-    const fromPlans = currentPlans.map((p) => p.tier.tierName)
-    const combined = new Set([...KNOWN_TIERS, ...fromPlans])
-    return Array.from(combined).sort()
-  }, [currentPlans])
+  const availableTiers = useMemo(() => availableBillingTiers(currentPlans), [currentPlans])
 
   const previewCards = useMemo(() => {
-    const plansByTier = new Map(currentPlans.map((plan) => [plan.tier.tierName, plan]))
-    const sourceTiers = currentPlans.map((plan) => plan.tier)
-    const draftTier: PricingCardTierInput | null = currentTierConfig
-      ? {
-          tierName: createTier,
-          monthlyPriceCents: createForm.monthlyPriceCents,
-          yearlyPriceCents: createForm.yearlyPriceCents,
-          trialDays: createForm.trialDays,
-          monthlyGbLimit: Math.max(0, Math.round(createForm.monthlyGbLimitGb * BYTES_PER_GB)),
-          monthlyLlmEventLimit: createForm.monthlyLlmEventLimit,
-          retentionDays: createForm.retentionDays,
-          apmTraceRetentionDays: createForm.apmTraceRetentionDays,
-          maxProjects: createForm.maxProjects.trim() ? Number(createForm.maxProjects) : null,
-          maxSystems: createForm.maxSystems,
-          monitorIntervalSeconds: createForm.monitorIntervalSeconds,
-          sessionReplayEnabled: currentTierConfig.sessionReplayEnabled,
-          statusPagesEnabled: currentTierConfig.statusPagesEnabled,
-          statusPageCustomDomainEnabled: currentTierConfig.statusPageCustomDomainEnabled,
-          slackEnabled: currentTierConfig.slackEnabled,
-          discordEnabled: currentTierConfig.discordEnabled,
-          incidentIoEnabled: currentTierConfig.incidentIoEnabled,
-          samlEnabled: currentTierConfig.samlEnabled,
-          oidcEnabled: currentTierConfig.oidcEnabled,
-          prioritySupportEnabled: currentTierConfig.prioritySupportEnabled,
-          slaEnabled: currentTierConfig.slaEnabled,
-          customRetentionEnabled: currentTierConfig.customRetentionEnabled,
-          oncallEnabled: createForm.oncallEnabled,
-          oncallPerUserMonthlyCents: createForm.oncallPerUserMonthlyCents,
-          maxAnalyticsSites: createForm.maxAnalyticsSites.trim() ? Number(createForm.maxAnalyticsSites) : null,
-          analyticsRetentionDays: createForm.analyticsRetentionDays,
-          monthlyAnalyticsPageviewLimit: createForm.monthlyAnalyticsPageviewLimit,
-          analyticsPageviewOverageRateCentsPer100k: createForm.analyticsPageviewOverageRateCentsPer100k,
-        }
-      : null
-
-    const merged = sourceTiers.map((tier) => {
-      if (tier.tierName === createTier && draftTier) return draftTier
-      return {
-        ...tier,
-        trialDays: plansByTier.get(tier.tierName)?.trialDays ?? tier.trialDays,
-      }
-    })
-
-    return merged
-      .sort((a, b) => (TIER_ORDER[a.tierName] ?? 99) - (TIER_ORDER[b.tierName] ?? 99))
-      .map((tier) => buildPricingCardModel(tier, previewInterval))
+    return buildPreviewCards(currentPlans, createTier, createForm, currentTierConfig, previewInterval)
   }, [createForm, createTier, currentPlans, currentTierConfig, previewInterval])
 
   // ─── Mutations ────────────────────────────────────────────────────────────
@@ -763,7 +860,7 @@ function AdminBillingPage() {
                       <TableCell>{formatInterval(plan.tier.monitorIntervalSeconds)}</TableCell>
                       <TableCell>
                         {plan.tier.paygEnabled ? (
-                          <Badge variant="outline" className="text-emerald-600 border-emerald-300">
+                          <Badge variant="success">
                             Enabled
                           </Badge>
                         ) : (
@@ -825,7 +922,7 @@ function AdminBillingPage() {
             {/* Event Limits Section Header */}
             <div className="bg-muted/30 border border-border rounded-md p-3">
               <div className="flex items-start gap-2">
-                <Info className="h-4 w-4 text-blue-500 mt-0.5 flex-shrink-0" />
+                <Info className="h-4 w-4 text-info-fg mt-0.5 flex-shrink-0" />
                 <div className="text-xs text-muted-foreground">
                   <strong>Event limits are for internal abuse prevention only.</strong> Stripe metering currently bills non-LLM/non-log overage in unit-based streams.
                   Keep these limits aligned with your Stripe overage policy (use -1 for unlimited replay sessions).
@@ -1131,8 +1228,8 @@ function AdminBillingPage() {
               {/* Specs */}
               <div className="space-y-1.5">
                 <Label htmlFor="maxProjects">
-                  Max Projects
-                  <HelpTip text="Maximum number of projects an organization on this tier can create. Leave blank for unlimited." />
+                  Max Services
+                  <HelpTip text="Maximum number of services an organization on this tier can create. Leave blank for unlimited." />
                 </Label>
                 <Input
                   id="maxProjects"
@@ -1144,7 +1241,7 @@ function AdminBillingPage() {
                     setCreateForm((p) => ({...p, maxProjects: val}))
                   }}
                 />
-                <FieldHint>{createForm.maxProjects ? `${createForm.maxProjects} projects` : 'Unlimited projects'}</FieldHint>
+                <FieldHint>{createForm.maxProjects ? `${createForm.maxProjects} services` : 'Unlimited services'}</FieldHint>
               </div>
               <div className="space-y-1.5">
                 <Label htmlFor="maxSystems">
@@ -1551,7 +1648,11 @@ function AdminBillingPage() {
 
             {/* Changes summary vs current version */}
             {currentTierConfig && (
-              <ChangeSummary current={currentTierConfig} form={createForm} />
+              <ChangeSummary
+                current={currentTierConfig}
+                form={createForm}
+                title={`Changes from current v${currentTierConfig.version}:`}
+              />
             )}
 
             <Separator />
@@ -1564,7 +1665,7 @@ function AdminBillingPage() {
                     onClick={() => setPreviewInterval('monthly')}
                     className={`relative rounded-md px-3 py-1.5 text-xs font-medium transition-all ${
                       previewInterval === 'monthly'
-                        ? 'bg-background text-foreground shadow-sm'
+                        ? 'bg-background text-foreground'
                         : 'text-muted-foreground hover:text-foreground'
                     }`}
                     type="button"
@@ -1575,7 +1676,7 @@ function AdminBillingPage() {
                     onClick={() => setPreviewInterval('yearly')}
                     className={`relative rounded-md px-3 py-1.5 text-xs font-medium transition-all ${
                       previewInterval === 'yearly'
-                        ? 'bg-background text-foreground shadow-sm'
+                        ? 'bg-background text-foreground'
                         : 'text-muted-foreground hover:text-foreground'
                     }`}
                     type="button"
@@ -1627,35 +1728,19 @@ function AdminBillingPage() {
             </DialogHeader>
 
             <div className="space-y-3 my-2">
-              <h4 className="text-sm font-medium">New configuration:</h4>
-              <div className="rounded border bg-muted/50 p-3 text-sm space-y-1">
-                <p><strong>Tier:</strong> {createTier}</p>
-                <p><strong>Monthly Price:</strong> ${centsToDollars(createForm.monthlyPriceCents)}/mo</p>
-                <p><strong>Yearly Price:</strong> ${centsToDollars(createForm.yearlyPriceCents)}/yr</p>
-                <p><strong>Monthly Data Limit:</strong> {createForm.monthlyGbLimitGb} GB</p>
-                <p><strong>Trial:</strong> {createForm.trialDays} day(s)</p>
-                <p><strong>Total Limit:</strong> {formatTotalQuotaLimit([
-                  createForm.monthlyErrorLimit,
-                  createForm.monthlyTransactionLimit,
-                  createForm.monthlyReplayLimit,
-                  createForm.monthlyFeedbackLimit,
-                ])}</p>
-                <p><strong>Errors:</strong> {formatQuotaLimit(createForm.monthlyErrorLimit)}</p>
-                <p><strong>Transactions:</strong> {formatQuotaLimit(createForm.monthlyTransactionLimit)}</p>
-                <p><strong>Replays:</strong> {formatQuotaLimit(createForm.monthlyReplayLimit)}</p>
-                <p><strong>Feedback:</strong> {formatQuotaLimit(createForm.monthlyFeedbackLimit)}</p>
-                <p><strong>LLM Events:</strong> {formatQuotaLimit(createForm.monthlyLlmEventLimit)}</p>
-                <p><strong>Retention:</strong> {createFormRetentionSummary(createForm)}</p>
-                <p><strong>Max Projects:</strong> {createForm.maxProjects || 'Unlimited'}</p>
-                <p><strong>Max Systems:</strong> {createForm.maxSystems}</p>
-                <p><strong>Monitor Interval:</strong> {formatInterval(createForm.monitorIntervalSeconds)}</p>
-                <p><strong>PAYG:</strong> {createForm.paygEnabled ? `Enabled (${createForm.paygRateMicrosPerUnit} micros/unit)` : 'Disabled'}</p>
-                <p><strong>Overage:</strong> ${(createForm.overageRateCentsPerGb / 100).toFixed(2)}/GB logs, ${(createForm.errorOverageRateCentsPer1k / 100).toFixed(2)}/1K errors, ${(createForm.replayOverageRateCentsPerGb / 100).toFixed(2)}/GB replays, ${(createForm.llmOverageRateCentsPer1k / 100).toFixed(2)}/1K LLM</p>
-                <p><strong>On-Call:</strong> {createForm.oncallEnabled ? `$${(createForm.oncallPerUserMonthlyCents / 100).toFixed(2)}/user/mo` : 'Disabled'}</p>
-              </div>
-              <div className="flex items-start gap-2 rounded border border-amber-200 bg-amber-50 dark:border-amber-800 dark:bg-amber-950 p-3">
-                <Info className="h-4 w-4 text-amber-600 mt-0.5 shrink-0" />
-                <p className="text-sm text-amber-800 dark:text-amber-200">
+              {currentTierConfig ? (
+                <ChangeSummary
+                  current={currentTierConfig}
+                  form={createForm}
+                  title="Selected changes:"
+                  emptyMessage={`No changes from current v${currentTierConfig.version}.`}
+                />
+              ) : (
+                <CreateConfigSummary tier={createTier} form={createForm} />
+              )}
+              <div className="flex items-start gap-2 rounded border border-warning-border bg-warning-bg p-3">
+                <Info className="h-4 w-4 text-warning-fg mt-0.5 shrink-0" />
+                <p className="text-sm text-warning-fg">
                   Existing subscribers will <strong>not</strong> be affected until you run a migration.
                 </p>
               </div>
@@ -1871,7 +1956,7 @@ function AdminBillingPage() {
                 </Select>
                 {currentMigrateTierConfig && (
                   <FieldHint>
-                    Currently on v{currentMigrateTierConfig.version}
+                    Active config: v{currentMigrateTierConfig.version}
                   </FieldHint>
                 )}
               </div>
@@ -1911,23 +1996,30 @@ function AdminBillingPage() {
               <div className="rounded border bg-muted/50 p-3 text-sm space-y-1">
                 <p className="font-medium mb-1">Target v{targetTierConfig.version} details:</p>
                 <p>Price: ${centsToDollars(targetTierConfig.monthlyPriceCents)}/mo</p>
-                <p>Total Limit: {formatQuotaLimit(targetTierConfig.monthlyUnitLimit)}</p>
-                <p>Errors: {formatQuotaLimit(targetTierConfig.monthlyErrorLimit)}</p>
-                <p>Transactions: {formatQuotaLimit(targetTierConfig.monthlyTransactionLimit)}</p>
-                <p>Replays: {formatQuotaLimit(targetTierConfig.monthlyReplayLimit)}</p>
-                <p>Feedback: {formatQuotaLimit(targetTierConfig.monthlyFeedbackLimit)}</p>
+                <p>Yearly Price: ${centsToDollars(targetTierConfig.yearlyPriceCents)}/yr</p>
+                <p>Monthly Data Limit: {Math.round(targetTierConfig.monthlyGbLimit / BYTES_PER_GB)} GB</p>
                 <p>LLM Events: {formatQuotaLimit(targetTierConfig.monthlyLlmEventLimit ?? 0)}</p>
                 <p>Retention: {retentionSummary(targetTierConfig)}</p>
+                <p>Max Services: {targetTierConfig.maxProjects ?? 'Unlimited'}</p>
                 <p>Max Systems: {targetTierConfig.maxSystems}</p>
                 <p>PAYG: {targetTierConfig.paygEnabled ? 'Enabled' : 'Disabled'}</p>
               </div>
             )}
 
+            {currentMigrateTierConfig && targetTierForm && (
+              <ChangeSummary
+                current={currentMigrateTierConfig}
+                form={targetTierForm}
+                title={`Target changes from active v${currentMigrateTierConfig.version}:`}
+                emptyMessage={`Target v${targetVersion} matches the current billing config.`}
+              />
+            )}
+
             {/* Dry run result */}
             {dryRunResult && (
-              <div className="flex items-start gap-2 rounded border border-blue-200 bg-blue-50 dark:border-blue-800 dark:bg-blue-950 p-3">
-                <Info className="h-4 w-4 text-blue-600 mt-0.5 shrink-0" />
-                <p className="text-sm text-blue-800 dark:text-blue-200">
+              <div className="flex items-start gap-2 rounded border border-info-border bg-info-bg p-3">
+                <Info className="h-4 w-4 text-info-fg mt-0.5 shrink-0" />
+                <p className="text-sm text-info-fg">
                   Dry run result: <strong>{dryRunResult.affected} subscription(s)</strong> would be
                   migrated to v{dryRunResult.version}.
                 </p>
@@ -1970,7 +2062,7 @@ function AdminBillingPage() {
           <DialogContent>
             <DialogHeader>
               <DialogTitle className="flex items-center gap-2">
-                <AlertTriangle className="h-5 w-5 text-amber-500" />
+                <AlertTriangle className="h-5 w-5 text-warning-fg" />
                 Confirm Migration
               </DialogTitle>
               <DialogDescription>
@@ -2076,8 +2168,8 @@ function AdminBillingPage() {
                       <TableCell className="text-xs text-muted-foreground">
                         {sub.currentPeriodStart && sub.currentPeriodEnd ? (
                           <>
-                            {formatDate(new Date(sub.currentPeriodStart), timezone)} &ndash;{' '}
-                            {formatDate(new Date(sub.currentPeriodEnd), timezone)}
+                            {formatDate(sub.currentPeriodStart, timezone)} &ndash;{' '}
+                            {formatDate(sub.currentPeriodEnd, timezone)}
                           </>
                         ) : (
                           '—'
@@ -2100,9 +2192,44 @@ function AdminBillingPage() {
   )
 }
 
-// ─── Change Summary Component ─────────────────────────────────────────────────
+// ─── Review Components ────────────────────────────────────────────────────────
 
-function ChangeSummary({current, form}: {current: BillingTierConfig; form: CreateFormState}) {
+function CreateConfigSummary({tier, form}: {tier: string; form: CreateFormState}) {
+  return (
+    <div className="rounded border bg-muted/50 p-3 text-sm space-y-1">
+      <p><strong>Tier:</strong> {tier}</p>
+      <p><strong>Monthly Price:</strong> ${centsToDollars(form.monthlyPriceCents)}/mo</p>
+      <p><strong>Yearly Price:</strong> ${centsToDollars(form.yearlyPriceCents)}/yr</p>
+      <p><strong>Monthly Data Limit:</strong> {form.monthlyGbLimitGb} GB</p>
+      <p><strong>Trial:</strong> {form.trialDays} day(s)</p>
+      <p><strong>LLM Events:</strong> {formatQuotaLimit(form.monthlyLlmEventLimit)}</p>
+      <p><strong>Retention:</strong> {createFormRetentionSummary(form)}</p>
+      <p><strong>Max Services:</strong> {form.maxProjects || 'Unlimited'}</p>
+      <p><strong>Max Systems:</strong> {form.maxSystems}</p>
+      <p><strong>Monitor Interval:</strong> {formatInterval(form.monitorIntervalSeconds)}</p>
+      <p>
+        <strong>PAYG:</strong>{' '}
+        {form.paygEnabled ? `Enabled (${form.paygRateMicrosPerUnit} micros/unit)` : 'Disabled'}
+      </p>
+      <p>
+        <strong>On-Call:</strong>{' '}
+        {form.oncallEnabled ? `$${(form.oncallPerUserMonthlyCents / 100).toFixed(2)}/user/mo` : 'Disabled'}
+      </p>
+    </div>
+  )
+}
+
+function ChangeSummary({
+  current,
+  form,
+  title,
+  emptyMessage,
+}: {
+  current: BillingTierConfig
+  form: CreateFormState
+  title: string
+  emptyMessage?: string
+}) {
   const changes: Array<{field: string; from: string; to: string}> = []
   const currentErrorLimit = normalizeQuotaForForm(current.monthlyErrorLimit)
   const currentTransactionLimit = normalizeQuotaForForm(current.monthlyTransactionLimit)
@@ -2206,7 +2333,7 @@ function ChangeSummary({current, form}: {current: BillingTierConfig; form: Creat
   const formMaxProjects = form.maxProjects.trim() ? Number(form.maxProjects) : null
   if (current.maxProjects !== formMaxProjects) {
     changes.push({
-      field: 'Max Projects',
+      field: 'Max Services',
       from: current.maxProjects != null ? String(current.maxProjects) : 'Unlimited',
       to: formMaxProjects != null ? String(formMaxProjects) : 'Unlimited',
     })
@@ -2313,23 +2440,21 @@ function ChangeSummary({current, form}: {current: BillingTierConfig; form: Creat
     return (
       <div className="flex items-center gap-2 rounded border p-3 text-sm text-muted-foreground">
         <Info className="h-4 w-4 shrink-0" />
-        No changes from current v{current.version}. Modify the fields above to see a diff.
+        {emptyMessage ?? `No changes from current v${current.version}. Modify the fields above to see a diff.`}
       </div>
     )
   }
 
   return (
     <div className="rounded border p-3 space-y-2">
-      <p className="text-sm font-medium">
-        Changes from current v{current.version}:
-      </p>
+      <p className="text-sm font-medium">{title}</p>
       <div className="space-y-1">
         {changes.map((c) => (
           <div key={c.field} className="text-sm flex items-center gap-2">
             <span className="text-muted-foreground w-36 shrink-0">{c.field}:</span>
-            <span className="text-red-600 dark:text-red-400 line-through">{c.from}</span>
+            <span className="text-danger-fg line-through">{c.from}</span>
             <span className="text-muted-foreground">&rarr;</span>
-            <span className="text-emerald-600 dark:text-emerald-400 font-medium">{c.to}</span>
+            <span className="text-success-fg font-medium">{c.to}</span>
           </div>
         ))}
       </div>
@@ -2349,11 +2474,11 @@ function PricingPreviewGrid({
       {cards.map((tier) => (
         <Card
           key={tier.tierName}
-          className={tier.highlight ? 'relative border-sky-500/50 shadow-md shadow-sky-500/10' : 'border-border/60'}
+          className={tier.highlight ? 'relative border-primary/50' : 'border-border/60'}
         >
           {tier.highlight && (
             <div className="absolute -top-3 left-1/2 -translate-x-1/2">
-              <span className="inline-flex items-center rounded-full bg-gradient-to-r from-sky-500 to-cyan-400 px-3 py-1 text-[10px] font-semibold text-white">
+              <span className="inline-flex items-center rounded-full bg-primary px-3 py-1 text-[10px] font-semibold text-primary-foreground">
                 Most popular
               </span>
             </div>
@@ -2373,10 +2498,10 @@ function PricingPreviewGrid({
           </CardHeader>
           <CardContent className="space-y-2">
             <ul className="space-y-1.5">
-              {tier.features.slice(0, 6).map((feature) => (
+              {tier.includedLimits.slice(0, PRICING_PREVIEW_LIMIT_COUNT).map((feature) => (
                 <li key={feature} className="flex items-start gap-2">
-                  <div className={`mt-0.5 rounded-full p-0.5 ${tier.highlight ? 'bg-sky-500/10' : 'bg-emerald-500/10'}`}>
-                    <Check className={`h-3 w-3 ${tier.highlight ? 'text-sky-500' : 'text-emerald-500'}`} />
+                  <div className={`mt-0.5 rounded-full p-0.5 ${tier.highlight ? 'bg-[hsl(var(--primary)/0.12)]' : 'bg-success-bg'}`}>
+                    <Check className={`h-3 w-3 ${tier.highlight ? 'text-primary' : 'text-success-fg'}`} />
                   </div>
                   <span className="text-xs leading-tight">{feature}</span>
                 </li>
@@ -2384,7 +2509,7 @@ function PricingPreviewGrid({
             </ul>
             <div className="pt-2 text-center">
               <Button
-                className={`w-full ${tier.highlight ? 'bg-sky-500 hover:bg-sky-400 text-white shadow-md shadow-sky-500/25' : ''}`}
+                className="w-full"
                 variant={tier.highlight ? 'default' : 'outline'}
                 size="sm"
                 disabled

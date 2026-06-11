@@ -17,8 +17,6 @@
 import {memo, type ComponentProps, type CSSProperties, type ReactNode, useEffect, useId, useMemo, useRef, useState} from 'react'
 import {useQuery} from '@tanstack/react-query'
 import type {DashboardWidget, TimeRangeDef} from '@/lib/api'
-import {api} from '@/lib/api'
-import {isDemo} from '@/lib/demo'
 import {
     Area,
     AreaChart,
@@ -47,6 +45,8 @@ import type {ValueMapping} from './formatValue'
 import {formatValue} from './formatValue'
 import {pivotData, valueKeySeries} from './widgetSeries'
 import {isWarningThresholdValid, type AlertThresholdPreview} from './alertThresholds'
+import {widgetQueryFingerprint} from './widgetQueryFingerprint'
+import {fetchWidgetRows, TIME_KEYS} from './widgetRows'
 
 const COLORS = [
   'hsl(var(--chart-1))',
@@ -57,8 +57,6 @@ const COLORS = [
   '#8884d8', '#82ca9d', '#ffc658', '#ff7300', '#00C49F',
   '#FF6B6B', '#4ECDC4', '#45B7D1', '#96CEB4', '#FFEAA7',
 ]
-
-const TIME_KEYS = new Set(['time_bucket', 'timestamp', 'time', 'Time', 'day', 'Day'])
 
 /**
  * Parse a ClickHouse datetime string as UTC epoch ms.
@@ -125,8 +123,8 @@ function DebouncedChartContainer({children, debounceMs = 150}: {
 
 interface WidgetRendererProps {
   widget: DashboardWidget
-  dashboardId: number
-  projectId?: number
+  dashboardId: string
+  projectId?: string
   timeRange: TimeRangeDef
   autoRefresh: boolean
   variables?: Record<string, string>
@@ -146,56 +144,12 @@ export const WidgetRenderer = memo(function WidgetRenderer({
   const queries = widget.query_configs?.length > 0 ? widget.query_configs : []
   const isBatch = queries.length > 1
   const isExtendedWidget = isExtendedWidgetType(widgetType)
-  // Include query config fingerprint so datasource/query changes trigger refetch
-  const queryFingerprint = JSON.stringify(queries.map(q => ({d: q.dataSource, r: q.rawQuery || ''})))
+  const queryFingerprint = widgetQueryFingerprint(queries)
 
   const {data, isLoading, error} = useQuery({
     queryKey: ['widget-data', widget.id, dashboardId, projectId, timeRange, queryFingerprint, variables],
-    queryFn: async () => {
-      if (!projectId && !isDemo()) return []
-      const effectiveProjectId = projectId ?? -1
-      if (isBatch) {
-        const result = await api.executeBatchQuery(dashboardId, queries, effectiveProjectId, timeRange, variables)
-        // Merge batch results: use legendFormat alias as series name, group by timestamp
-        const mergedByTime = new Map<unknown, Record<string, unknown>>()
-        for (const [refId, rows] of Object.entries(result.results)) {
-          if (queries.length === 1) {
-            for (const row of rows) {
-              const timeVal = Object.entries(row).find(([k]) => TIME_KEYS.has(k))
-              const key = timeVal ? timeVal[1] : rows.indexOf(row)
-              if (!mergedByTime.has(key)) mergedByTime.set(key, {})
-              Object.assign(mergedByTime.get(key)!, row)
-            }
-          } else {
-            const queryIdx = queries.findIndex(q => q.ref_id === refId)
-            const query = queryIdx >= 0 ? queries[queryIdx] : queries[refId.charCodeAt(0) - 65]
-            const alias = query?.metrics?.[0]?.alias
-            for (const row of rows) {
-              let timeKey: string | undefined
-              let timeVal: unknown
-              const values: Record<string, unknown> = {}
-              for (const [k, v] of Object.entries(row)) {
-                if (TIME_KEYS.has(k)) {
-                  timeKey = k
-                  timeVal = v
-                } else if (typeof v === 'number') {
-                  values[alias || `${refId}: ${k}`] = v
-                }
-              }
-              if (timeKey != null) {
-                if (!mergedByTime.has(timeVal)) mergedByTime.set(timeVal, {[timeKey]: timeVal})
-                Object.assign(mergedByTime.get(timeVal)!, values)
-              }
-            }
-          }
-        }
-        return Array.from(mergedByTime.values())
-      }
-      return queries[0]
-        ? api.executeWidgetQuery(dashboardId, queries[0], effectiveProjectId, timeRange, variables)
-        : []
-    },
-    enabled: (!!projectId || isDemo()) && isQueryDrivenWidget(widgetType) && queries.length > 0,
+    queryFn: () => fetchWidgetRows({dashboardId, projectId, queries, isBatch, timeRange, variables}),
+    enabled: !!projectId && isQueryDrivenWidget(widgetType) && queries.length > 0,
     refetchInterval: autoRefresh ? 30000 : false,
   })
 
@@ -1517,7 +1471,7 @@ const TableWidget = memo(function TableWidget({data, displayConfig: dc}: {data: 
   return (
     <div ref={parentRef} className="h-full overflow-auto">
       <table className="w-full text-xs">
-        <thead className="sticky top-0 bg-muted/90 z-10 shadow-sm">
+        <thead className="sticky top-0 bg-muted/90 z-10">
           <tr>
             {columns.map((col) => (
               <th key={col} className="text-left px-2 py-1.5 font-medium whitespace-nowrap bg-background/95 backdrop-blur">

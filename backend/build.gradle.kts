@@ -32,6 +32,33 @@ tasks.shadowJar {
     manifest {
         attributes("Main-Class" to application.mainClass.get())
     }
+    // GraalVM's polyglot language selectors (org.graalvm.polyglot:js, org.graalvm.js:js)
+    // are POM-only meta modules; their resolved artifact is a .pom that shadow cannot
+    // unzip ("Cannot expand ZIP …js-*.pom"). Exclude the meta artifacts — the actual
+    // language jars (js-language, truffle-api, truffle-runtime, regex, icu4j, …) are
+    // separate modules and stay on the classpath.
+    dependencies {
+        exclude(dependency("org.graalvm.polyglot:js:.*"))
+        exclude(dependency("org.graalvm.js:js:.*"))
+    }
+}
+
+val dashboardTemplateSourceDir =
+    providers.gradleProperty("dashboardTemplateSource")
+        .orElse(providers.environmentVariable("DASHBOARD_TEMPLATE_SOURCE_DIR"))
+        .orElse(layout.projectDirectory.dir("../grafana-dashboards").asFile.absolutePath)
+
+tasks.register<JavaExec>("convertDashboardTemplates") {
+    group = "dashboard"
+    description = "Converts community dashboard JSON into Moneat dashboard template resources."
+    dependsOn(tasks.named("testClasses"))
+    classpath = sourceSets["test"].runtimeClasspath
+    mainClass.set("com.moneat.dashboards.tools.DashboardTemplateConverterKt")
+    args(
+        dashboardTemplateSourceDir.get(),
+        layout.projectDirectory.dir("src/main/resources/dashboard-templates").asFile.absolutePath,
+        layout.buildDirectory.file("reports/dashboard-template-conversion.json").get().asFile.absolutePath
+    )
 }
 
 repositories {
@@ -101,6 +128,12 @@ dependencies {
     // Redis
     implementation(libs.lettuce)
 
+    // Workflow execution
+    implementation(libs.jackson.module.kotlin)
+    implementation(libs.temporal.sdk)
+    implementation(libs.graalvm.polyglot)
+    implementation(libs.graalvm.polyglot.js)
+
     // JDBC drivers for custom datasources
     runtimeOnly(libs.mysql.connector.j)
     runtimeOnly(libs.mariadb.java.client)
@@ -131,6 +164,9 @@ dependencies {
 
     // JSON path query for uptime monitoring
     implementation(libs.jsonpath)
+
+    // YAML parsing for Sigma detection-rule import
+    implementation(libs.snakeyaml)
 
     // Environment variables
     implementation(libs.dotenv.kotlin)
@@ -169,6 +205,7 @@ dependencies {
     testRuntimeOnly(libs.junit.jupiter.engine)
     testImplementation(libs.h2)
     testImplementation(libs.mockk)
+    testImplementation(libs.temporal.testing)
     testImplementation(kotlin("reflect"))
 
     // Integration testing dependencies
@@ -309,7 +346,7 @@ val integrationTest =
 
 // JaCoCo configuration
 jacoco {
-    toolVersion = "0.8.14"
+    toolVersion = "0.8.15"
 }
 
 val jacocoBackendMainExcludes =
@@ -444,6 +481,7 @@ tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach 
 // Detekt - static analysis
 detekt {
     config.setFrom(files("$projectDir/detekt.yml"))
+    baseline = file("$projectDir/detekt-baseline.xml")
     buildUponDefaultConfig = true
     parallel = true
     source.setFrom(files("src/main/kotlin", "src/test/kotlin", "src/integrationTest/kotlin"))

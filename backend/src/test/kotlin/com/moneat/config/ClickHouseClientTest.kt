@@ -23,6 +23,7 @@ import io.ktor.client.statement.bodyAsText
 import kotlinx.coroutines.runBlocking
 import java.net.URLDecoder
 import java.nio.charset.StandardCharsets
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.test.AfterTest
 import kotlin.test.Test
 import kotlin.test.assertContains
@@ -107,14 +108,116 @@ class ClickHouseClientTest {
                 "text/plain"
             )
         }) {
-            assertFailsWith<IllegalStateException> {
+            val ex = assertFailsWith<ClickHouseQueryException> {
                 ClickHouseClient.executeWithFormat("SELECT 1", "TabSeparated")
             }
+            assertEquals(true, ex.isTimeout)
+            assertEquals("Query timed out", ex.message)
         }
 
         val rendered = OperationalMetrics.scrape()
         assertContains(rendered, "moneat_clickhouse_query_errors_total")
         assertContains(rendered, "operation=\"execute\"")
+        assertContains(rendered, "code=\"159\"")
+    }
+
+    @Test
+    fun `executeWithFormat detects timeout messages case insensitively`() = runBlocking {
+        withClickHouseMockServer({ exchange ->
+            exchange.respond(
+                200,
+                "Code: 999. DB::Exception: Timeout exceeded while reading",
+                "text/plain"
+            )
+        }) {
+            val ex = assertFailsWith<ClickHouseQueryException> {
+                ClickHouseClient.executeWithFormat("SELECT 1", "TabSeparated")
+            }
+            assertEquals(true, ex.isTimeout)
+            assertEquals("Query timed out", ex.message)
+        }
+    }
+
+    @Test
+    fun `executeWithFormat sends default format without rewriting query body`() = runBlocking {
+        val requestQueries = mutableListOf<String?>()
+        val requestBodies = mutableListOf<String>()
+        withClickHouseMockServer({ exchange ->
+            requestQueries.add(exchange.requestURI.rawQuery)
+            requestBodies.add(exchange.requestBody.readBytes().toString(StandardCharsets.UTF_8))
+            exchange.respond(200, "1\n", "text/plain")
+        }) {
+            assertEquals("1\n", ClickHouseClient.executeWithFormat("SELECT 1", "JSONEachRow"))
+        }
+
+        val params = parseQueryParams(requestQueries.single())
+        assertEquals("JSONEachRow", params["default_format"])
+        assertEquals("SELECT 1", requestBodies.single())
+    }
+
+    @Test
+    fun `executeWithFormat sends default format when format appears outside a clause`() = runBlocking {
+        val requestQueries = mutableListOf<String?>()
+        val requestBodies = mutableListOf<String>()
+        val query = "SELECT 'FORMAT' AS label, formatDateTime(now(), '%F') AS rendered"
+        withClickHouseMockServer({ exchange ->
+            requestQueries.add(exchange.requestURI.rawQuery)
+            requestBodies.add(exchange.requestBody.readBytes().toString(StandardCharsets.UTF_8))
+            exchange.respond(200, "1\n", "text/plain")
+        }) {
+            assertEquals("1\n", ClickHouseClient.executeWithFormat(query, "JSONEachRow"))
+        }
+
+        val params = parseQueryParams(requestQueries.single())
+        assertEquals("JSONEachRow", params["default_format"])
+        assertEquals(query, requestBodies.single())
+    }
+
+    @Test
+    fun `executeWithFormat rejects unsupported format before request`() = runBlocking {
+        val requestCount = AtomicInteger(0)
+        withClickHouseMockServer({ exchange ->
+            requestCount.incrementAndGet()
+            exchange.respond(200, "1\n", "text/plain")
+        }) {
+            assertFailsWith<IllegalArgumentException> {
+                ClickHouseClient.executeWithFormat("SELECT 1", "CSV")
+            }
+        }
+        assertEquals(0, requestCount.get())
+    }
+
+    @Test
+    fun `executeLongRunning completes for a successful response`() = runBlocking {
+        val requestQueries = mutableListOf<String?>()
+        withClickHouseMockServer({ exchange ->
+            requestQueries.add(exchange.requestURI.rawQuery)
+            exchange.respond(200, "", "text/plain")
+        }) {
+            // Should not throw on success.
+            ClickHouseClient.executeLongRunning("INSERT INTO apm_traces_final SELECT 1")
+        }
+        // Uses the migration client path, so no read-query timeout settings are attached.
+        val params = parseQueryParams(requestQueries.single())
+        assertFalse(params.containsKey("max_execution_time"))
+    }
+
+    @Test
+    fun `executeLongRunning throws and records the operation on a ClickHouse error`() = runBlocking {
+        OperationalMetrics.resetForTest()
+        withClickHouseMockServer({ exchange ->
+            exchange.respond(200, "Code: 159. DB::Exception: Timeout exceeded", "text/plain")
+        }) {
+            val ex = assertFailsWith<ClickHouseQueryException> {
+                ClickHouseClient.executeLongRunning(
+                    "INSERT INTO apm_traces_final SELECT 1",
+                    operation = "trace_finalize",
+                )
+            }
+            assertEquals(true, ex.isTimeout)
+        }
+        val rendered = OperationalMetrics.scrape()
+        assertContains(rendered, "operation=\"trace_finalize\"")
         assertContains(rendered, "code=\"159\"")
     }
 

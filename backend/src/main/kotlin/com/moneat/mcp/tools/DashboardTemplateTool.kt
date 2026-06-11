@@ -25,6 +25,7 @@ import com.moneat.dashboards.repositories.DashboardWidgetRepositoryImpl
 import com.moneat.events.repositories.ProjectRepositoryImpl
 import com.moneat.dashboards.services.CustomDashboardService
 import com.moneat.dashboards.services.DashboardQueryEngine
+import com.moneat.dashboards.services.DashboardTemplateCatalogService
 import com.moneat.dashboards.translation.DataDogTranslator
 import com.moneat.dashboards.translation.GrafanaTranslator
 import com.moneat.mcp.models.McpContext
@@ -41,6 +42,7 @@ private val templateDashService = CustomDashboardService(
     DashboardWidgetRepositoryImpl(),
     ProjectRepositoryImpl { col, _, _ -> col },
 )
+private val dashboardTemplateCatalogService = DashboardTemplateCatalogService()
 private val dashQueryEngine = DashboardQueryEngine()
 private val dataDogTranslator = DataDogTranslator()
 private val grafanaTranslator = GrafanaTranslator()
@@ -58,8 +60,7 @@ class GetDashboardTemplatesTool : McpTool {
         args: JsonObject,
         context: McpContext
     ): ToolCallResult {
-        val templates =
-            templateDashService.getDefaultDashboardTemplates()
+        val templates = dashboardTemplateCatalogService.listTemplates()
         return jsonResult(templates)
     }
 }
@@ -153,7 +154,7 @@ class ExecuteDashboardQueryTool : McpTool {
     override val inputSchema = InputSchema(
         properties = JsonObject(
             mapOf(
-                "project_id" to schemaNumber("Project ID"),
+                "project_id" to schemaProjectId(),
                 "query_config" to schemaObject(
                     "Query DSL config (QueryDsl JSON)"
                 ),
@@ -169,12 +170,9 @@ class ExecuteDashboardQueryTool : McpTool {
     override suspend fun execute(
         args: JsonObject,
         context: McpContext
-    ): ToolCallResult {
-        val projectId = args["project_id"]?.jsonPrimitive
-            ?.content?.toLongOrNull()
-            ?: return errorResult("project_id is required")
+    ): ToolCallResult = withRequiredProjectId(args) { projectId ->
         val queryConfigJson = args["query_config"] as? JsonObject
-            ?: return errorResult("query_config must be an object")
+            ?: return@withRequiredProjectId errorResult("query_config must be an object")
         val retentionDays = args["retention_days"]?.jsonPrimitive
             ?.content?.toIntOrNull() ?: DEFAULT_RETENTION_DAYS
 
@@ -184,12 +182,12 @@ class ExecuteDashboardQueryTool : McpTool {
                 queryConfigJson
             )
         } catch (e: Exception) {
-            return errorResult(
+            return@withRequiredProjectId errorResult(
                 "Invalid query_config: ${e.message}"
             )
         }
 
-        return try {
+        try {
             val results = dashQueryEngine.executeQuery(
                 dsl = dsl,
                 projectId = projectId,

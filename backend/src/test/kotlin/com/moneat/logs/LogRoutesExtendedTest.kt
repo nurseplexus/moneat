@@ -16,11 +16,14 @@
 
 package com.moneat.logs
 
-import com.moneat.logs.routes.logRoutes
 import com.moneat.logs.models.LogIndexResponse
 import com.moneat.logs.models.LogIndexTestResponse
+import com.moneat.logs.routes.LogManagementRouteDependencies
+import com.moneat.logs.routes.LogRouteDependencies
+import com.moneat.logs.routes.logRoutes as installLogRoutes
 import com.moneat.logs.services.LogIndexService
 import com.moneat.logs.services.LogService
+import com.moneat.org.services.OrgMembershipService
 import com.moneat.otlp.models.CreateOtlpApiKeyResponse
 import com.moneat.otlp.models.OtlpApiKeyResponse
 import com.moneat.otlp.models.OtlpObservedServiceResponse
@@ -41,6 +44,7 @@ import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.HttpStatusCode
 import io.ktor.http.contentType
+import io.ktor.server.routing.Route
 import io.ktor.server.routing.routing
 import io.ktor.server.testing.testApplication
 import io.mockk.coEvery
@@ -57,6 +61,7 @@ class LogRoutesExtendedTest {
     private val mockLogService = mockk<LogService>(relaxed = true)
     private val mockOtlpApiKeyService = mockk<OtlpApiKeyService>(relaxed = true)
     private val mockLogIndexService = mockk<LogIndexService>(relaxed = true)
+    private val mockMembershipService = mockk<OrgMembershipService>(relaxed = true)
     private val mockOtlpServiceRoutingService = mockk<OtlpServiceRoutingService>(relaxed = true)
 
     @BeforeTest
@@ -67,6 +72,48 @@ class LogRoutesExtendedTest {
     @AfterTest
     fun teardown() {
         stopTestKoin()
+    }
+
+    private fun Route.logRoutes(
+        logService: LogService,
+        otlpApiKeyService: OtlpApiKeyService,
+        logIndexService: LogIndexService
+    ) {
+        installLogRoutes(
+            LogRouteDependencies(
+                logService = logService,
+                otlpApiKeyService = otlpApiKeyService,
+                logIndexService = logIndexService,
+                logManagement = LogManagementRouteDependencies(
+                    logIndexService = logIndexService,
+                    logService = logService,
+                    membershipService = mockMembershipService,
+                ),
+                membershipService = mockMembershipService,
+            )
+        )
+    }
+
+    private fun Route.logRoutes(
+        logService: LogService,
+        otlpApiKeyService: OtlpApiKeyService,
+        logIndexService: LogIndexService,
+        otlpServiceRoutingService: OtlpServiceRoutingService
+    ) {
+        installLogRoutes(
+            LogRouteDependencies(
+                logService = logService,
+                otlpApiKeyService = otlpApiKeyService,
+                logIndexService = logIndexService,
+                otlpServiceRoutingService = otlpServiceRoutingService,
+                logManagement = LogManagementRouteDependencies(
+                    logIndexService = logIndexService,
+                    logService = logService,
+                    membershipService = mockMembershipService,
+                ),
+                membershipService = mockMembershipService,
+            )
+        )
     }
 
     // ──── Auth checks (401 without JWT) ────
@@ -104,6 +151,36 @@ class LogRoutesExtendedTest {
             }
 
             val response = client.get("/v1/logs/aggregate")
+            assertEquals(HttpStatusCode.Unauthorized, response.status)
+        }
+
+    @Test
+    fun `GET logs returns 401 when JWT has no org`() =
+        testApplication {
+            application {
+                installJwtAuth()
+                routing { logRoutes(mockLogService, mockOtlpApiKeyService, mockLogIndexService) }
+            }
+
+            val response = client.get("/v1/logs") {
+                withAuth(RouteTestSupport.createToken(userId = 1, orgId = null))
+            }
+
+            assertEquals(HttpStatusCode.Unauthorized, response.status)
+        }
+
+    @Test
+    fun `GET log pipelines returns 401 when JWT has no org`() =
+        testApplication {
+            application {
+                installJwtAuth()
+                routing { logRoutes(mockLogService, mockOtlpApiKeyService, mockLogIndexService) }
+            }
+
+            val response = client.get("/v1/logs/pipelines") {
+                withAuth(RouteTestSupport.createToken(userId = 1, orgId = null))
+            }
+
             assertEquals(HttpStatusCode.Unauthorized, response.status)
         }
 
@@ -599,17 +676,7 @@ class LogRoutesExtendedTest {
             coEvery {
                 mockLogService.exportCsv(
                     organizationId = 1,
-                    from = null,
-                    to = null,
-                    query = null,
-                    levels = emptyList(),
-                    service = null,
-                    environment = null,
-                    tags = emptyMap(),
-                    excludeService = null,
-                    excludeEnvironment = null,
-                    excludeContainerName = null,
-                    excludeTags = emptyMap(),
+                    filters = any(),
                     limit = 5000
                 )
             } returns "timestamp,message\n2026-01-01T00:00:00Z,hello\n"
@@ -638,7 +705,6 @@ class LogRoutesExtendedTest {
             val response = client.get("/v1/logs/tail")
 
             assertEquals(HttpStatusCode.Unauthorized, response.status)
-            assertTrue(response.bodyAsText().contains("Unauthorized"))
         }
 
     // ──── OTLP service routing ────
@@ -653,6 +719,7 @@ class LogRoutesExtendedTest {
                     serviceNamespace = "checkout",
                     serviceName = "api",
                     projectId = 30,
+                    projectResourceId = "11111111-1111-1111-1111-111111111111",
                     projectName = "Backend",
                     seenLogs = true,
                     seenTraces = false,
@@ -680,8 +747,12 @@ class LogRoutesExtendedTest {
             }
 
             assertEquals(HttpStatusCode.OK, response.status)
-            assertTrue(response.bodyAsText().contains("checkout"))
-            assertTrue(response.bodyAsText().contains("Backend"))
+            val responseBody = response.bodyAsText()
+            assertTrue(responseBody.contains("checkout"))
+            assertTrue(responseBody.contains("Backend"))
+            assertTrue(
+                responseBody.contains(""""project_resource_id":"11111111-1111-1111-1111-111111111111"""")
+            )
         }
 
     @Test
@@ -692,6 +763,7 @@ class LogRoutesExtendedTest {
                 serviceNamespace = "checkout",
                 serviceName = "api",
                 projectId = 30,
+                projectResourceId = "11111111-1111-1111-1111-111111111111",
                 projectName = "Backend",
                 updatedAt = "2026-01-01T00:00:00Z"
             )
@@ -715,7 +787,11 @@ class LogRoutesExtendedTest {
             }
 
             assertEquals(HttpStatusCode.OK, response.status)
-            assertTrue(response.bodyAsText().contains("Backend"))
+            val responseBody = response.bodyAsText()
+            assertTrue(responseBody.contains("Backend"))
+            assertTrue(
+                responseBody.contains(""""project_resource_id":"11111111-1111-1111-1111-111111111111"""")
+            )
         }
 
     @Test
