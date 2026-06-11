@@ -54,6 +54,8 @@ import org.msgpack.value.ValueType
 import java.io.ByteArrayInputStream
 import java.time.Instant
 import java.util.Base64
+import java.util.zip.GZIPInputStream
+import java.util.zip.InflaterInputStream
 
 private val logger = KotlinLogging.logger {}
 

@@ -120,9 +120,16 @@ export const overviewTestData: OverviewResponse = {
     label: 'regressing',
     ageLabel: '14m',
   }],
-  activity: [{
-    kind: 'deploy',
-    text: 'v2.4.1 released to checkout-api',
-    meta: '14m ago',
-  }],
+  activity: [
+    {
+      kind: 'deploy',
+      text: 'v2.4.1 released to checkout-api',
+      meta: '14m ago',
+    },
+    {
+      kind: 'issue',
+      text: 'Payment capture failed',
+      meta: '8m ago',
+    },
+  ],
 }

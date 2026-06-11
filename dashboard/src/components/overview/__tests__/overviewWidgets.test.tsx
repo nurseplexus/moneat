@@ -131,5 +131,6 @@ describe('ActivityWidget', () => {
     renderWithOverview(<ActivityWidget />)
     expect(screen.getByTestId('widget-activity')).toBeInTheDocument()
     expect(screen.getByText('v2.4.1 released to checkout-api')).toBeInTheDocument()
+    expect(screen.getByText('Payment capture failed')).toBeInTheDocument()
   })
 })

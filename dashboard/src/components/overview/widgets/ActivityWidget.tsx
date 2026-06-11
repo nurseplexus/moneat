@@ -15,19 +15,22 @@
 // along with this program. If not, see <https://www.gnu.org/licenses/>.
 
 import type {ComponentType} from 'react'
-import {Clock, Flag, MessageSquare, PlayCircle, Rocket, Siren, Workflow} from 'lucide-react'
+import {CircleAlert, Clock, Flag, MessageSquare, PlayCircle, Rocket, Siren, Workflow} from 'lucide-react'
 import {cn} from '@/lib/utils'
 import {useActivity, type ActivityKind} from '../overviewData'
 import {OverviewPanel, PanelLink} from '../OverviewPanel'
 
 const KIND: Record<ActivityKind, {icon: ComponentType<{className?: string}>; cls: string}> = {
   incident: {icon: Siren, cls: 'bg-danger-bg text-danger-fg'},
+  issue: {icon: CircleAlert, cls: 'bg-danger-bg text-danger-fg'},
   flag: {icon: Flag, cls: 'bg-[hsl(var(--primary)/0.12)] text-primary'},
   deploy: {icon: Rocket, cls: 'bg-info-bg text-info-fg'},
   workflow: {icon: Workflow, cls: 'bg-warning-bg text-warning-fg'},
   replay: {icon: PlayCircle, cls: 'bg-muted text-muted-foreground'},
   feedback: {icon: MessageSquare, cls: 'bg-muted text-muted-foreground'},
 }
+
+const DEFAULT_KIND = {icon: Clock, cls: 'bg-muted text-muted-foreground'}
 
 /** Recent activity feed across the workspace. */
 export function ActivityWidget() {
@@ -41,7 +44,7 @@ export function ActivityWidget() {
     >
       <div>
         {items.map((it) => {
-          const {icon: Icon, cls} = KIND[it.kind]
+          const {icon: Icon, cls} = KIND[it.kind] ?? DEFAULT_KIND
           const itemKey = `${it.kind}:${it.text}:${it.meta}`
           return (
             <div key={itemKey} className="flex gap-1.5 border-b border-border/40 py-1 last:border-0">
